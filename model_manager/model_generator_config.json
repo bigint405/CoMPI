@@ -1,0 +1,34 @@
+[
+    {
+        "type": "resnet50",
+        "class": 2,
+        "num": 5,
+        "just_retrain_head": false
+    },{
+        "type": "resnet50",
+        "class": 2,
+        "num": 7,
+        "just_retrain_head": true
+    },{
+        "type": "resnet101",
+        "class": 2,
+        "num": 3,
+        "just_retrain_head": false
+    },{
+        "type": "resnet101",
+        "class": 2,
+        "num": 3,
+        "just_retrain_head": true
+    },{
+        "type": "resnet152",
+        "class": 3,
+        "num": 2,
+        "just_retrain_head": false
+    },{
+        "type": "resnet152",
+        "class": 3,
+        "num": 2,
+        "just_retrain_head": true
+    }
+
+]

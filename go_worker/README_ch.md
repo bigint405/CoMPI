@@ -1,0 +1,1 @@
+先执行make生成动态链接库文件`libonnx_cgo.so`而后运行go项目。

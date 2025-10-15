@@ -1,0 +1,45 @@
+{
+    "models": [{
+            "name":"resnet50['n01644900', 'n04252225']",
+            "type": {
+                "type":"resnet50",
+                "task":"classification",
+                "class":2
+            },
+            "model_path":"generator_logs/resnet50['n01644900', 'n04252225']/epoch_19.pth",
+            "train_dataset":{
+                "type":"image_folder",
+                "base_path":"/workspace/datasets/imagenet-1k/train",
+                "class":["n01644900","n04252225"]
+            },
+            "val_dataset":{
+                "type":"image_folder",
+                "base_path":"/workspace/datasets/imagenet-1k/val",
+                "class":["n01644900","n04252225"]
+            },
+            "min_acc": 0.85,
+            "SLO": 2
+        },{
+            "name":"resnet50(just_head)['n02808440', 'n02124075']",
+            "type": {
+                "type":"resnet50",
+                "task":"classification",
+                "class":2
+            },
+            "model_path":"generator_logs/resnet50(just_head)['n02808440', 'n02124075']/epoch_19.pth",
+            "train_dataset":{
+                "type":"image_folder",
+                "base_path":"/workspace/datasets/imagenet-1k/train",
+                "class":["n02808440","n02124075"]
+            },
+            "val_dataset":{
+                "type":"image_folder",
+                "base_path":"/workspace/datasets/imagenet-1k/val",
+                "class":["n02808440","n02124075"]
+            },
+            "min_acc": 0.85,
+            "SLO": 3
+        }
+    ],
+    "device": "cuda:0"
+}

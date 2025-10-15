@@ -1,0 +1,84 @@
+{
+    "model_config": [
+        {
+            "id": "A",
+            "SLO": 10000,
+            "start_stage": "resnet152_1000_2_0"
+        },
+        {
+            "id": "B",
+            "SLO": 10000,
+            "start_stage": "resnet152_1000_2_0"
+        }
+    ],
+    "dag_config": {
+        "stages": [
+            {
+                "id": "resnet152_1000_2_0",
+                "models": [
+                    "A",
+                    "B"
+                ]
+            },
+            {
+                "id": "resnet152_1000_2_1",
+                "models": [
+                    "A",
+                    "B"
+                ]
+            }
+        ],
+        "edges": [
+            {
+                "source": "resnet152_1000_2_0",
+                "target": "resnet152_1000_2_1",
+                "models": [
+                    "A"
+                ],
+                "type": "normal"
+            },
+            {
+                "source": "resnet152_1000_2_0",
+                "target": "resnet152_1000_2_1",
+                "models": [
+                    "B"
+                ],
+                "type": "direct"
+            }
+        ]
+    },
+    "stage_profile": [
+        {
+            "id": "resnet152_1000_2_0",
+            "latency": 100.0,
+            "max_bs": 16,
+            "num_output": 1,
+            "model_size": 0,
+            "input_size": 0,
+            "running_max_size": 0
+        },
+        {
+            "id": "resnet152_1000_2_1",
+            "latency": 100.0,
+            "max_bs": 16,
+            "num_output": 1,
+            "model_size": 0,
+            "input_size": 0,
+            "running_max_size": 0
+        }
+    ],
+    "device_num": 4,
+    "static_deployment": [
+        [
+            "resnet152_1000_2_0",
+            "resnet152_1000_2_1"
+        ],
+        [
+            "resnet152_1000_2_1"
+        ]
+    ],
+    "just_static": true,
+    "discard": false,
+    "debug": true,
+    "debug_size": 100000
+}

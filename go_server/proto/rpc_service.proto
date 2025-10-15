@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+option go_package = "compi_go_server/rpc_server";
+
+service GetTargetDeviceService {
+    rpc GetTarget (GetTargetRequest) returns (GetTargetResponse);
+}
+
+service FinishBatchService {
+    rpc FinishBatch (FinishBatchRequest) returns (FinishBatchResponse);
+}
+
+service FinishInferService {
+    rpc FinishInfer (FinishInferRequest) returns (FinishInferResponse);
+}
+
+service SetTargetDeviceService {
+    rpc SetTarget (SetTargetRequest) returns (SetTargetResponse);
+}
+
+service StartInferService {
+    rpc StartInfer (StartInferRequest) returns (StartInferResponse);
+}
+
+service RegisterDeviceService {
+    rpc RegisterDevice (RegisterDeviceRequest) returns (RegisterDeviceResponse);
+}
+
+message GetTargetRequest {
+    int32 rank = 1; // 来源设备的发送rank
+    string batch_id = 2;
+    repeated string request_ids = 3;
+}
+
+enum TargetAction {
+    FORWARD = 0;
+    FINISH = 1;
+    DISCARD = 2;
+}
+
+message GetTargetResponse {
+    repeated int32 action = 1; // 按照TargetAction，0代表正常转发，1代表直接发送结果到服务器，2代表丢弃
+    repeated string ip = 2; // 接收端ip
+    repeated uint32 start_tags = 3; // batch中每个请求的第一个向量的tag，依次递增
+}
+
+message RequestTime {
+    double recv_time = 1;
+    double start_queueing_time = 2;
+    double send_time = 3;
+}
+
+message FinishBatchRequest {
+    string batch_id = 1;
+    repeated string request_ids = 2;
+    repeated RequestTime request_times = 3;
+    double start_infer_time = 4;
+    double finish_infer_time = 5;
+    double finish_post_process_time = 6;
+}
+
+message FinishBatchResponse {
+    int32 status = 1;
+}
+
+message FinishInferRequest {
+    string request_id = 1;
+    bytes tensors = 2;  //所有向量量化并打包到一个 []byte 中传输
+    RequestTime request_time = 3;
+    double start_infer_time = 4;
+    double finish_infer_time = 5;
+    double finish_post_process_time = 6;
+    string batch_id = 7;
+}
+
+message FinishInferResponse {
+    int32 status = 1;
+}
+
+message Shape {
+    repeated int32 shape = 1; // shape的每个分量
+}
+
+message SetTargetRequest {
+    string request_id = 1;
+    // int32 source_rank = 2; // 源设备的rank
+    repeated string stage_id = 2; // 待处理stage的id的序列
+    string batch_id = 3; // 目标batch的id
+    float rt = 4; // batch的新rt
+    int32 device_num = 5; // 目标设备的序号
+    uint32 start_tag = 6; // 开始接收的tag
+    int32 max_bs = 7; // 新建batch用
+}
+
+message SetTargetResponse {
+    int32 status = 1;
+}
+
+message TensorList {
+    repeated bytes tensors = 1; // 多个向量
+}
+
+message StartInferRequest {
+    int32 device_num = 1;
+    string stage_id = 2; // 待处理stage的id
+    string batch_id = 3; // 目标batch的id
+    float rt = 4; // batch的新rt
+    int32 max_bs = 5; // 只有新batch该值才不为0
+    repeated string request_id = 7;
+    repeated TensorList inputs = 8;  // 每个向量以 `.npy` 格式传输
+}
+
+message StartInferResponse {
+    int32 status = 1;
+}
+
+message RegisterDeviceRequest {
+    int32 device_num = 1;
+    string ip = 2; // 设备的ip
+    repeated int64 max_mem = 3; // 设备的显存（B）
+}
+
+message Stages {
+    repeated string stage = 1; // 模拟 `[]string`
+}
+
+message RegisterDeviceResponse {
+    int32 start_rank = 1;
+    int32 world_size = 2;
+    repeated Stages static_deployment = 3; // 模拟 `[][]string`
+}
+
