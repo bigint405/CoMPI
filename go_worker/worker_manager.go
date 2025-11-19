@@ -283,6 +283,7 @@ func (m *WorkerManager) Start() bool {
 				Action:    LOAD,
 				ModelID:   stage,
 				ModelPath: m.modelPath[stage],
+				WarmUp:    true,
 			})
 		}
 	}

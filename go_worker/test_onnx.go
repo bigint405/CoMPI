@@ -17,7 +17,7 @@ func test() {
 	modelPath := C.CString("/root/datas/models/resnet-152.onnx")
 	defer C.free(unsafe.Pointer(modelPath))
 
-	session := C.ORT_LoadModel(modelPath, 0)
+	session := C.ORT_LoadModel(modelPath, 0, 0)
 	if session == nil {
 		panic("❌ Failed to load ONNX model")
 	}

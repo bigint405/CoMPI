@@ -29,9 +29,10 @@ extern "C"
      * @brief 加载 ONNX 模型并创建推理会话
      * @param model_path 模型路径（.onnx 文件）
      * @param gpu_id 使用的 GPU 设备编号
+     * @param enable_cuda_graph 是否使用cuda graph
      * @return 成功返回 ORTSession*，失败返回 nullptr
      */
-    ORTSession *ORT_LoadModel(const char *model_path, int gpu_id);
+    ORTSession* ORT_LoadModel(const char* model_path, int gpu_id, int enable_cuda_graph);
 
     /**
      * @brief 创建 GPU 上的输入张量

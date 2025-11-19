@@ -158,6 +158,7 @@ type ModelControlCommand struct {
 	ModelID   string
 	ModelPath string
 	Action    action
+	WarmUp    bool
 }
 
 type GPUWorker struct {
@@ -173,6 +174,7 @@ type GPUWorker struct {
 	batchs              sync.Map     // batch_id(short) -> *WorkerBatch
 
 	inferCond *sync.Cond
+	warmUpMu  sync.Mutex
 
 	getTargetStub   pb.GetTargetDeviceServiceClient
 	finishInferStub pb.FinishInferServiceClient
@@ -570,13 +572,18 @@ func (w *GPUWorker) modelControlLoop(ctx context.Context, wg *sync.WaitGroup) {
 		case cmd := <-w.modelControlChan:
 			modelID := cmd.ModelID
 			if cmd.Action == LOAD {
-				sess, err := LoadModel(cmd.ModelPath, w.deviceIDOnMachine)
+				sess, err := LoadModel(cmd.ModelPath, w.deviceIDOnMachine, w.useCUDAGraph)
 				if err != nil {
 					log.Printf("[GPU %d] load Model %s error", w.deviceIDOnMachine, modelID)
 					continue
 				}
 				if w.useCUDAGraph {
 					SetSessionCUDAGraphEnabled(sess, true)
+					if cmd.WarmUp {
+						w.warmUpMu.Lock()
+						// TODO warmup
+						w.warmUpMu.Unlock()
+					}
 				}
 				w.sessionLock.Lock()
 				w.sessions[modelID] = sess

@@ -97,7 +97,7 @@ extern "C"
         }
     }
 
-    ORTSession* ORT_LoadModel(const char* model_path, int gpu_id) {
+    ORTSession* ORT_LoadModel(const char* model_path, int gpu_id, int enable_cuda_graph) {
         auto ort_session = new ORTSession();
         try {
             ort_session->gpu_id = gpu_id;
@@ -115,10 +115,19 @@ extern "C"
                 cuda_guard(cuda_options, api.ReleaseCUDAProviderOptions);
     
             std::string gpu_id_str = std::to_string(gpu_id);
+            int numKey;
             const char* keys[]   = {"device_id", "enable_cuda_graph"};
             const char* values[] = {gpu_id_str.c_str(), "1"};
+            if (enable_cuda_graph)
+            {
+                numKey = 2;
+            }
+            else
+            {
+                numKey = 1;
+            }
             Ort::ThrowOnError(api.UpdateCUDAProviderOptions(
-                cuda_guard.get(), keys, values, 2));
+                cuda_guard.get(), keys, values, numKey));
     
             Ort::ThrowOnError(api.SessionOptionsAppendExecutionProvider_CUDA_V2(
                 static_cast<OrtSessionOptions*>(session_options),

@@ -18,9 +18,13 @@ import (
 type ORTSession = C.ORTSession
 type ORTTensor = C.ORTTensor
 
-func LoadModel(modelPath string, deviceID int) (*ORTSession, error) {
+func LoadModel(modelPath string, deviceID int, enableCudaGraph bool) (*ORTSession, error) {
 	cPath := C.CString(modelPath)
-	sess := C.ORT_LoadModel(cPath, C.int(deviceID))
+	ecg := 0
+	if enableCudaGraph {
+		ecg = 1
+	}
+	sess := C.ORT_LoadModel(cPath, C.int(deviceID), C.int(ecg))
 	C.free(unsafe.Pointer(cPath))
 	if sess == nil {
 		return nil, errors.New("load onnx model error")
@@ -224,7 +228,7 @@ func DequantizeFBGEMM(data []byte) ([][]float32, []int32, [][]int64, func(), err
 		&cNumVecs,
 	)
 	if status != 0 {
-		return nil, nil, nil, nil, errors.New(fmt.Sprintf("dequantization failed: %d", int(status)))
+		return nil, nil, nil, nil, fmt.Errorf("dequantization failed: %d", int(status))
 	}
 
 	num := int(cNumVecs)
