@@ -14,7 +14,14 @@ extern "C"
     // 表示 GPU 或 CPU 上的张量
     typedef struct ORTTensor ORTTensor;
 
+    typedef struct GraphSlotKey GraphSlotKey;
+
+    typedef struct GraphSlot GraphSlot;
+
     size_t ORT_GetOutputCount(ORTSession *session);
+
+    // Enable or disable CUDA graph integration for a given session.
+    void ORT_SetCudaGraphEnabled(ORTSession *session, int enabled);
 
     int ORT_GetTensorShape(ORTTensor *tensor, int64_t **out_shape, size_t *out_len);
 
@@ -144,6 +151,33 @@ extern "C"
         int64_t ***out_shapes,
         int32_t **out_shape_lens,
         int *out_num_vecs);
+
+    // Create or update the graph-managed input tensor for a given (batch_size, ping_index) slot.
+    //
+    // Parameters:
+    //   session      – target ORT session
+    //   ping_index   – 0 or 1 (ping–pong index)
+    //   data_ptrs    – array of length batch_size; each points to a float32 sample
+    //   batch_size   – number of VALID samples in this batch
+    //   single_len   – number of float32 elements per sample
+    //   shape        – full ONNX tensor shape (shape[0] is the logical batch dim)
+    //   shape_len    – rank of the tensor
+    //
+    // Returns:
+    //   ORTTensor* pointing to the persistent GPU input tensor for this slot.
+    //   The same pointer is returned on subsequent calls with the same
+    //   (batch_size in shape[0], ping_index) key.
+    ORTTensor *ORT_CreateOrUpdateGraphInput(
+        ORTSession *session,
+        int ping_index,
+        int input_index,
+        const float **data_ptrs,
+        int batch_size,
+        size_t single_len,
+        const int64_t *shape,
+        size_t shape_len);
+
+    ORTTensor **ORT_RunInferenceWithGraphSlot(ORTSession *session, int64_t batch_size_graph, int ping_index);
 
 #ifdef __cplusplus
 }

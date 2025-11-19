@@ -27,9 +27,8 @@ service RegisterDeviceService {
 }
 
 message GetTargetRequest {
-    int32 rank = 1; // 来源设备的发送rank
-    string batch_id = 2;
-    repeated string request_ids = 3;
+    string batch_id = 1;
+    repeated string request_ids = 2;
 }
 
 enum TargetAction {
@@ -39,7 +38,7 @@ enum TargetAction {
 }
 
 message GetTargetResponse {
-    repeated int32 action = 1; // 按照TargetAction，0代表正常转发，1代表直接发送结果到服务器，2代表丢弃
+    repeated TargetAction action = 1; // 按照TargetAction，0代表正常转发，1代表直接发送结果到服务器，2代表丢弃
     repeated string ip = 2; // 接收端ip
     repeated uint32 start_tags = 3; // batch中每个请求的第一个向量的tag，依次递增
 }
@@ -90,6 +89,7 @@ message SetTargetRequest {
     int32 device_num = 5; // 目标设备的序号
     uint32 start_tag = 6; // 开始接收的tag
     int32 max_bs = 7; // 新建batch用
+    bool follow_server_infer = 8; // 是否跟随server确认推理
 }
 
 message SetTargetResponse {
@@ -101,13 +101,9 @@ message TensorList {
 }
 
 message StartInferRequest {
-    int32 device_num = 1;
-    string stage_id = 2; // 待处理stage的id
-    string batch_id = 3; // 目标batch的id
-    float rt = 4; // batch的新rt
-    int32 max_bs = 5; // 只有新batch该值才不为0
-    repeated string request_id = 7;
-    repeated TensorList inputs = 8;  // 每个向量以 `.npy` 格式传输
+    string batch_id = 1;
+    int32  device_num = 2; // 该 batch 要在哪个本机 GPU 上跑
+    int32  final_bs   = 3; // 最终 batchsize（<= max_bs）
 }
 
 message StartInferResponse {

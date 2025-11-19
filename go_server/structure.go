@@ -34,6 +34,7 @@ type StageProfile struct {
 	ModelSize      int64     `json:"model_size"`
 	InputSize      int64     `json:"input_size"`
 	RunningMaxSize int64     `json:"running_max_size"`
+	FillTimeOut    float64   `json:"fill_time_out"`
 }
 
 type SchedulerConfig struct {

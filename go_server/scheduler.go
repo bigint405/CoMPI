@@ -22,7 +22,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-const epsilon = 5.0 // 留一点富余，防止精度问题引起的额外计算，可手动调整
+const epsilon = 5.0 // 留一点富余，防止精度问题引起的额外计算，可手动调整。同一batch内不同RT的最大差距
 
 type stageInfo struct {
 	id             string
@@ -33,6 +33,7 @@ type stageInfo struct {
 	modelSize      int64
 	inputSize      int64
 	runningMaxSize int64
+	fillTimeOut    float64 // 凑一个batch等待的最大毫秒数
 
 	deviceMu        sync.Mutex
 	deployedDevices map[string]*deviceInfo // 已部署的设备
@@ -54,10 +55,11 @@ func (s *stageInfo) getDirectLatency(modelID string) float64 {
 }
 
 type stageSequence struct {
-	stageIDs []string
-	taskChan chan *requestInfo
-	latency  float64
-	maxBS    int32
+	stageIDs    []string
+	taskChan    chan *requestInfo
+	latency     float64
+	maxBS       int32
+	fillTimeOut int64 // 一个batch超时的纳秒数
 
 	batchMu       sync.Mutex
 	queueingBatch *btree.BTree
@@ -66,12 +68,13 @@ type stageSequence struct {
 	deployedDevices map[string]*deviceInfo // 已部署的设备
 }
 
-func (sche *Scheduler) NewStageSequence(stageIDs []string, latency float64, maxBS int32) *stageSequence {
+func (sche *Scheduler) NewStageSequence(stageIDs []string, latency float64, maxBS int32, fillTimeOut float64) *stageSequence {
 	sSeq := &stageSequence{
-		stageIDs: stageIDs,
-		taskChan: make(chan *requestInfo, maxBS),
-		latency:  latency,
-		maxBS:    maxBS,
+		stageIDs:    stageIDs,
+		taskChan:    make(chan *requestInfo, maxBS),
+		latency:     latency,
+		maxBS:       maxBS,
+		fillTimeOut: int64(fillTimeOut * 1e6), // 毫秒到纳秒
 
 		queueingBatch: btree.New(3),
 
@@ -127,11 +130,11 @@ type requestInfo struct {
 	modelID     string
 	data        []byte
 
-	batchID    string      // 传到哪个batch中
-	action     chan int32  // 作为中间结果，存储GetTarget的action
-	recvDevice *deviceInfo // 接收结果的设备
-	startTag   uint32      // 传输中间结果的起始tag，随数量递增
-	finalResp  chan int32  // 最终结果，存储状态，0代表正常，1代表丢弃
+	batchID    string               // 传到哪个batch中
+	action     chan pb.TargetAction // 作为中间结果，存储GetTarget的action
+	recvDevice *deviceInfo          // 接收结果的设备
+	startTag   uint32               // 传输中间结果的起始tag，随数量递增
+	finalResp  chan int32           // 最终结果，存储状态，0代表正常，1代表丢弃
 
 	stageTimeMu sync.Mutex
 	stageTimes  map[string]StageTime // stageID -> stage time
@@ -193,6 +196,13 @@ type batchInfo struct {
 	sendMu      sync.Mutex
 	reqs        map[string]*requestInfo // req_id -> req
 	hasMidReq   bool                    // 包含中间stage的请求，不可被丢弃
+	// NEW —— 批级超时/收口
+	createdAt time.Time
+	deadline  time.Time
+	timer     *time.Timer
+	closed    bool      // 该批已收口，不再接收新样本
+	finalBS   int32     // 收口时一次性确定
+	closeOnce sync.Once // 防重复 finalize（满批+超时竞态）
 }
 
 func (a *batchInfo) Less(b btree.Item) bool {
@@ -202,10 +212,14 @@ func (a *batchInfo) Less(b btree.Item) bool {
 	return a.rt < b.(*batchInfo).rt
 }
 
-func (batch *batchInfo) full() bool {
-	batch.reqMu.RLock()
-	defer batch.reqMu.RUnlock()
-	return len(batch.reqs) >= int(batch.stageSeq.maxBS)
+func (b *batchInfo) isOpen() bool {
+	if b == nil {
+		return false
+	}
+	if b.closed || len(b.reqs) >= int(b.stageSeq.maxBS) {
+		return false
+	}
+	return true
 }
 
 func (batch *batchInfo) addReq(req *requestInfo) {
@@ -584,7 +598,7 @@ func (sche *Scheduler) getStageSequence(modelID, stageID string) *stageSequence 
 		stageSeq = stageSeqAny2.(*stageSequence)
 	} else {
 		stage := sche.getStage(stageID)
-		stageSeq = sche.NewStageSequence(stageIDs, stage.getModelLatency(modelID), stage.maxBS)
+		stageSeq = sche.NewStageSequence(stageIDs, stage.getModelLatency(modelID), stage.maxBS, stage.fillTimeOut)
 		sche.stageSeqStageMap.Store(stageKey, stageSeq)
 	}
 	sche.newStageSeqMu.Unlock()
@@ -621,7 +635,7 @@ func (sche *Scheduler) getNextStageSequence(modelID, stageID string) *stageSeque
 		stageSeq = stageSeqAny2.(*stageSequence)
 	} else {
 		stage := sche.getStage(stageID)
-		stageSeq = sche.NewStageSequence(stageIDs, stage.getModelLatency(modelID), stage.maxBS)
+		stageSeq = sche.NewStageSequence(stageIDs, stage.getModelLatency(modelID), stage.maxBS, stage.fillTimeOut)
 		sche.stageSeqStageMap.Store(stageKey, stageSeq)
 	}
 	sche.newStageSeqMu.Unlock()
@@ -641,6 +655,7 @@ func (sche *Scheduler) loadStageProfile(config *[]StageProfile) {
 			modelSize:      s.ModelSize,
 			inputSize:      s.InputSize,
 			runningMaxSize: s.RunningMaxSize,
+			fillTimeOut:    s.FillTimeOut,
 
 			shapeInput:      s.ShapeInput,
 			deviceMu:        sync.Mutex{},
@@ -805,6 +820,49 @@ func (sche *Scheduler) RegisterDevice(machineIP string, deviceNum int32, maxMem 
 	return sr, sche.deviceNum /*worker数量*/, &staticDeployment, nil
 }
 
+// batch 超时或满了，准备发车开始推理
+func (sche *Scheduler) finalizeBatch(b *batchInfo, reason string) {
+	b.closeOnce.Do(func() {
+		// 停止timer并清空通道
+		if b.timer != nil {
+			if !b.timer.Stop() {
+				select {
+				case <-b.timer.C:
+				default:
+				}
+			}
+		}
+		log.Printf("Finalize batch because of %s, batch %s", reason, b.id)
+		// 从 stage 的 queueingBatch 下树（避免后续被误命中）
+		b.stageSeq.batchMu.Lock()
+		b.stageSeq.queueingBatch.Delete(b)
+		b.stageSeq.batchMu.Unlock()
+
+		// 标记关闭、确定 final_bs
+		b.reqMu.Lock()
+		finalBS := int32(len(b.reqs))
+		b.closed = true
+		b.finalBS = finalBS
+		b.reqMu.Unlock()
+
+		if b.device != nil {
+			// 各req数据在stageworker中已经发过（或正在发送）发“发车信号”到 worker（复用 StartInferService）
+			log.Printf("Batchsize confirm %d, of batch %s", b.finalBS, b.id)
+			go func() {
+				req := &pb.StartInferRequest{
+					BatchId:   b.id,
+					DeviceNum: b.device.deviceNumOnMachine,
+					FinalBs:   finalBS,
+				}
+				_, err := b.device.rpc.StartInferServiceClient.StartInfer(context.Background(), req)
+				if err != nil {
+					log.Printf("ERROR: StartInfer %s failed: %v", b.id, err)
+				}
+			}()
+		}
+	})
+}
+
 func checkDeviceFinishQueueOnTime(now float64, di *deviceInfo) (bool, float64) {
 	ok := true
 	if di.queueingBatch.Len() > 0 {
@@ -966,11 +1024,6 @@ func (sche *Scheduler) deployBatchOnGPU(batch *batchInfo) *deviceInfo {
 	return device
 }
 
-func (sche *Scheduler) deployStageOnGPU(batch *batchInfo) *deviceInfo {
-	//
-	return nil // TODO: 动态部署 记得在每次改变部署设备（增加、删除）时更新StageSequence的deployedDevices
-}
-
 func (sche *Scheduler) scheduleReqOnBatch(ri *requestInfo) (*batchInfo, bool) {
 	batch := sche.deployReqOnQueueingBatch(ri)
 	stageSeq := sche.getStageSequence(ri.modelID, ri.stageIDs[0])
@@ -979,13 +1032,14 @@ func (sche *Scheduler) scheduleReqOnBatch(ri *requestInfo) (*batchInfo, bool) {
 		// 建立新batch
 		new_batch = true
 		batch = &batchInfo{
-			id:       "batch-" + xid.New().String(),
-			stageSeq: stageSeq,
-			stageIDs: ri.stageIDs,
-			reqMu:    sync.RWMutex{},
-			sendMu:   sync.Mutex{},
-			reqs:     make(map[string]*requestInfo),
-			latency:  stageSeq.latency,
+			id:        "batch-" + xid.New().String(),
+			stageSeq:  stageSeq,
+			stageIDs:  ri.stageIDs,
+			reqMu:     sync.RWMutex{},
+			sendMu:    sync.Mutex{},
+			reqs:      make(map[string]*requestInfo),
+			latency:   stageSeq.latency,
+			createdAt: time.Now(),
 		}
 		log.Printf("Creating new batch for %s: %s", ri.stageIDs, batch.id)
 		batch.addReq(ri)
@@ -1001,19 +1055,30 @@ func (sche *Scheduler) scheduleReqOnBatch(ri *requestInfo) (*batchInfo, bool) {
 		}
 		// 保存batch
 		sche.batchs.Store(batch.id, batch)
+		// 设置batch的deadline
+		batch.deadline = batch.createdAt.Add(time.Duration(stageSeq.fillTimeOut) * time.Nanosecond)
+		if stageSeq.fillTimeOut > 0 {
+			d := time.Until(batch.deadline)
+			batch.timer = time.NewTimer(d)
+			go func(b *batchInfo) {
+				<-b.timer.C
+				sche.finalizeBatch(b, "timeout")
+			}(batch)
+		}
 	}
 	return batch, new_batch
 }
 
-func startInfer(ri *requestInfo, batch *batchInfo, stageIDs []string, maxBs int32) {
+func startInfer(ri *requestInfo, batch *batchInfo, stageIDs []string, maxBs int32, fillTimeOut int64) {
 	rpcReq := &pb.SetTargetRequest{
-		RequestId: ri.id,
-		StageId:   stageIDs,
-		BatchId:   batch.id,
-		Rt:        float32(batch.rt),
-		DeviceNum: batch.device.deviceNumOnMachine,
-		StartTag:  ri.startTag,
-		MaxBs:     maxBs,
+		RequestId:         ri.id,
+		StageId:           stageIDs,
+		BatchId:           batch.id,
+		Rt:                float32(batch.rt),
+		DeviceNum:         batch.device.deviceNumOnMachine,
+		StartTag:          ri.startTag,
+		MaxBs:             maxBs,
+		FollowServerInfer: fillTimeOut != 0,
 	}
 	go func() {
 		_, err := batch.device.rpc.SetTargetDeviceServiceClient.SetTarget(context.Background(), rpcReq)
@@ -1037,15 +1102,12 @@ func startInfer(ri *requestInfo, batch *batchInfo, stageIDs []string, maxBs int3
 func (sche *Scheduler) stageWorker(stage *stageSequence) {
 	var req *requestInfo
 	for {
-		startStageReqs := make([]*requestInfo, stage.maxBS)[:0]
-		midStageReqs := make([]*requestInfo, stage.maxBS)[:0]
+		startStageReqs := make([]*requestInfo, 0, stage.maxBS)
+		midStageReqs := make([]*requestInfo, 0, stage.maxBS)
 		ids := fmt.Sprint(stage.stageIDs)
 		if req == nil { // 没有之前未处理的req，取出新req处理
 			req = <-stage.taskChan
 			log.Printf("stage %s get req %s", ids, req.id)
-			// if len(stage.taskChan) == 0 {
-			// 	time.Sleep(time.Duration(float64(time.Millisecond) * epsilon))
-			// }
 		} else {
 			log.Printf("stage %s get newReq %s with new batch", ids, req.id)
 		}
@@ -1058,14 +1120,18 @@ func (sche *Scheduler) stageWorker(stage *stageSequence) {
 
 		stage.batchMu.Lock()
 		batch, _ := sche.scheduleReqOnBatch(req)
+		closed := false
 		log.Printf("stage %s put req %s in batch %s", ids, req.id, batch.id)
+		// 从该stage堆积的请求中找出适合一块放到该batch里的，避免每次都重新找一遍
 		for {
-			// batch如果满了从stage的队列中去掉
-			if batch.full() {
+			// batch如果满了或者不接收了就从stage的batch队列中去掉
+			if !batch.isOpen() {
+				closed = true
 				stage.queueingBatch.Delete(batch)
 				req = nil
 				break
 			}
+			// 没有堆积的请求了，退出
 			if len(stage.taskChan) == 0 {
 				req = nil
 				break
@@ -1075,25 +1141,29 @@ func (sche *Scheduler) stageWorker(stage *stageSequence) {
 			if math.Abs(newReq.rt-req.rt) <= epsilon {
 				log.Printf("stage %s put newReq %s in batch %s", ids, newReq.id, batch.id)
 				batch.addReqWithoutUpdateRT(newReq)
-
 				if sche.isFirstStage(newReq) {
 					startStageReqs = append(startStageReqs, newReq)
 				} else {
 					midStageReqs = append(midStageReqs, newReq)
 				}
+				// 满足放到该batch中，继续从队列中拿
 				continue
+			} else {
+				// 不满足放到该batch中的条件，重新找一个
+				req = newReq
+				break
 			}
-			req = newReq
-			break
 		}
 		stage.batchMu.Unlock()
+
+		// 进行req的转发
 		if batch.device != nil {
-			log.Printf("Deploying batch %s -> device %s, rt: %s", batch.id, batch.device.id, getTimeStr(batch.rt))
-			// 分别处理起始stage的请求
+			log.Printf("Deploying batch %s -> device %s, rt: %s, batchsize: %d", batch.id, batch.device.id, getTimeStr(batch.rt), len(batch.reqs))
+			// 分别处理起始stage的请求，将其发送到目标设备
 			s := ""
 			for _, ri := range startStageReqs {
 				ri.startTag = sche.getTagAndAdd(1)
-				go startInfer(ri, batch, ri.stageIDs, stage.maxBS)
+				go startInfer(ri, batch, ri.stageIDs, stage.maxBS, stage.fillTimeOut)
 				s += ri.id + ", "
 			}
 			log.Printf("startStageReqs of batch %s of stage %s len: %d with reqs: %s", batch.id, ids, len(startStageReqs), s)
@@ -1106,18 +1176,24 @@ func (sche *Scheduler) stageWorker(stage *stageSequence) {
 				ri.startTag = sche.getTagAndAdd(1) // 所有向量打包成一个[]byte了，所以这里只用+1
 				ri.recvDevice = batch.device
 				ri.batchID = batch.id
-				ri.action <- int32(pb.TargetAction_FORWARD)
+				// 通知该请求的转发目标
+				ri.action <- pb.TargetAction_FORWARD
 			}
 			log.Printf("midStageReqs of %s len: %d with reqs: %s", ids, len(midStageReqs), s)
+
+			// batch已满，可以执行了
+			if closed {
+				sche.finalizeBatch(batch, "full")
+			}
 		} else {
-			// batch没有设备，丢弃
+			// batch没有可用设备，丢弃并通知
 			log.Printf("batch %s discard", batch.id)
 			for _, ri := range startStageReqs {
 				ri.finalResp <- 1
 			}
 			for _, ri := range midStageReqs {
-				ri.action <- int32(pb.TargetAction_DISCARD) // 通知 HandleMidStageReq
-				ri.finalResp <- 1                           // 通知 HandleRequest
+				ri.action <- pb.TargetAction_DISCARD // 通知 HandleMidStageReq
+				ri.finalResp <- 1                    // 通知 HandleRequest
 			}
 		}
 	}
@@ -1142,7 +1218,7 @@ func (sche *Scheduler) HandleRequest(req *PredictRequest) (int32, []byte) {
 		stageIDs:   stageSeq.stageIDs,
 		modelID:    req.ModelID,
 		data:       req.Input,
-		action:     make(chan int32, 1), // 留一个缓冲，不然会造成stageWorker死锁
+		action:     make(chan pb.TargetAction, 1), // 留一个缓冲，不然会造成stageWorker死锁
 		finalResp:  make(chan int32, 1),
 		stageTimes: make(map[string]StageTime),
 	}
@@ -1161,7 +1237,7 @@ func (sche *Scheduler) HandleRequest(req *PredictRequest) (int32, []byte) {
 	return state, ri.data
 }
 
-func (sche *Scheduler) HandleMidStageReq(batchID string, reqIDs []string, sourceRank int32) ([]int32, []string, []uint32, error) {
+func (sche *Scheduler) HandleMidStageReq(batchID string, reqIDs []string) ([]pb.TargetAction, []string, []uint32, error) {
 	batch := sche.getBatch(batchID)
 	if batch == nil {
 		log.Printf("ERROR: no batch: %s", batchID)
@@ -1173,7 +1249,7 @@ func (sche *Scheduler) HandleMidStageReq(batchID string, reqIDs []string, source
 	batch.stageSeq.queueingBatch.Delete(batch)
 	batch.stageSeq.batchMu.Unlock()
 
-	action := make([]int32, len(reqIDs))
+	action := make([]pb.TargetAction, len(reqIDs))
 	ip := make([]string, len(reqIDs))
 	startTags := make([]uint32, len(reqIDs))
 	batch.reqMu.Lock() // 此时可能有其它协程也在处理推理该batch请求的任务
@@ -1184,7 +1260,7 @@ func (sche *Scheduler) HandleMidStageReq(batchID string, reqIDs []string, source
 		reqs = append(reqs, req)
 		nextStageSeq := sche.getNextStageSequence(req.modelID, req.stageIDs[len(req.stageIDs)-1])
 		if nextStageSeq == nil { // 最后一个stage
-			action[i] = int32(pb.TargetAction_FINISH)
+			action[i] = pb.TargetAction_FINISH
 			log.Printf("request %s finish", req.id)
 		} else {
 			log.Printf("request %s from %s to %s", req.id, req.stageIDs, fmt.Sprintln(nextStageSeq.stageIDs))
@@ -1200,12 +1276,12 @@ func (sche *Scheduler) HandleMidStageReq(batchID string, reqIDs []string, source
 	// 并行阻塞等待结果
 	var wg sync.WaitGroup
 	for i, req := range reqs {
-		if action[i] != int32(pb.TargetAction_FINISH) {
+		if action[i] != pb.TargetAction_FINISH {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				action[i] = <-req.action
-				if action[i] == int32(pb.TargetAction_DISCARD) {
+				if action[i] == pb.TargetAction_DISCARD {
 					return // 丢弃
 				}
 				ip[i] = req.recvDevice.ipOfMachine + ":50053"
@@ -1213,13 +1289,14 @@ func (sche *Scheduler) HandleMidStageReq(batchID string, reqIDs []string, source
 				nextStage := sche.getStage(req.stageIDs[0])
 				// 通过 rpc SetTarget 通知接收端
 				rpcReq := &pb.SetTargetRequest{
-					RequestId: req.id,
-					StageId:   req.stageIDs,
-					BatchId:   req.batchID,
-					Rt:        float32(req.rt),
-					DeviceNum: req.recvDevice.deviceNumOnMachine,
-					StartTag:  req.startTag,
-					MaxBs:     nextStage.maxBS,
+					RequestId:         req.id,
+					StageId:           req.stageIDs,
+					BatchId:           req.batchID,
+					Rt:                float32(req.rt),
+					DeviceNum:         req.recvDevice.deviceNumOnMachine,
+					StartTag:          req.startTag,
+					MaxBs:             nextStage.maxBS,
+					FollowServerInfer: nextStage.fillTimeOut != 0,
 				}
 				go req.recvDevice.rpc.SetTargetDeviceServiceClient.SetTarget(context.Background(), rpcReq)
 			}()

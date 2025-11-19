@@ -31,7 +31,7 @@ type rpcServer struct {
 
 func (s *rpcServer) GetTarget(ctx context.Context, req *rpc_server.GetTargetRequest) (*rpc_server.GetTargetResponse, error) {
 	log.Printf("GetTarget request: batch %s, req_id: %s", req.GetBatchId(), fmt.Sprintln(req.GetRequestIds()))
-	action, ip, startTags, err := s.sche.HandleMidStageReq(req.GetBatchId(), req.GetRequestIds(), req.GetRank())
+	action, ip, startTags, err := s.sche.HandleMidStageReq(req.GetBatchId(), req.GetRequestIds())
 	resp := &rpc_server.GetTargetResponse{Action: action, Ip: ip, StartTags: startTags}
 	return resp, err
 }

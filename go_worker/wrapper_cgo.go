@@ -81,9 +81,52 @@ func RunInferenceFixedOutput(session *ORTSession, inputs []*ORTTensor, batchSize
 		for i := range int(l) {
 			C.ORT_ReleaseTensor(outputSlice[i])
 		}
+		C.free(unsafe.Pointer(outputsPtr))
 	}
 
 	return outputSlice, releaseFunc, nil
+}
+
+// RunInferenceWithGraphSlot 使用 graph 管理的固定 input/output 缓冲区执行一次推理。
+//
+//	batchSizeGraph – graph 视角下的 batch 维（通常是 maxBS）
+//	pingIndex      – 0 / 1，对应 ping–pong 槽
+//
+// 返回：长度为 session 输出个数的 []*ORTTensor 切片，这些 tensor 全部由 session 持有，
+//
+//	不需要（也不能）纳入 per-batch 的释放逻辑。
+func RunInferenceWithGraphSlot(
+	session *ORTSession,
+	batchSizeGraph int64,
+	pingIndex int,
+) ([]*ORTTensor, error) {
+	if session == nil {
+		return nil, errors.New("nil session")
+	}
+
+	cBatch := C.int64_t(batchSizeGraph)
+	cPing := C.int(pingIndex)
+
+	outputsPtr := C.ORT_RunInferenceWithGraphSlot(
+		session,
+		cBatch,
+		cPing,
+	)
+	if outputsPtr == nil {
+		return nil, errors.New("ORT_RunInferenceWithGraphSlot failed")
+	}
+
+	// 输出个数从 C 侧查询
+	l := C.ORT_GetOutputCount(session)
+	if l == 0 {
+		return nil, errors.New("no outputs")
+	}
+
+	// 和 RunInferenceFixedOutput 一样，用 unsafe.Slice 构造零拷贝切片
+	outputSlice := unsafe.Slice(outputsPtr, l)
+
+	// 注意：这些 ORTTensor* 由 session 持久持有，不要在 batch 结束时调用 ORT_ReleaseTensor
+	return outputSlice, nil
 }
 
 // QuantizeVectorsFBGEMMBytes 执行量化并返回零拷贝的 []byte（需手动释放）
@@ -218,30 +261,140 @@ func DequantizeFBGEMM(data []byte) ([][]float32, []int32, [][]int64, func(), err
 	return floatVecs, dims, shapes, release, nil
 }
 
+// DecodeRawVectors 在非量化模式下解析一条样本的原始 bytes，
+// 直接在同一块地址空间上零拷贝返回每个输入向量及其 shape。
+func DecodeRawVectors(data []byte) ([][]float32, [][]int64, error) {
+	if len(data) < 4 {
+		return nil, nil, errors.New("raw data too short for numVecs")
+	}
+	p := 0
+
+	// 1) numVecs
+	numVecs := *(*int32)(unsafe.Pointer(&data[p]))
+	p += 4
+	if numVecs <= 0 {
+		return nil, nil, errors.New("numVecs <= 0 in raw data")
+	}
+	n := int(numVecs)
+
+	// 2) dims[0..n-1]
+	need := 4 * n
+	if len(data) < p+need {
+		return nil, nil, errors.New("raw data too short for dims")
+	}
+	dimsSlice := unsafe.Slice((*int32)(unsafe.Pointer(&data[p])), n)
+	p += need
+
+	// 3) shapeLens[0..n-1]
+	if len(data) < p+need {
+		return nil, nil, errors.New("raw data too short for shapeLens")
+	}
+	shapeLenSlice := unsafe.Slice((*int32)(unsafe.Pointer(&data[p])), n)
+	p += need
+
+	// 4) shapes flatten
+	totalShape := 0
+	for i := 0; i < n; i++ {
+		if shapeLenSlice[i] < 0 {
+			return nil, nil, errors.New("negative shapeLen in raw data")
+		}
+		totalShape += int(shapeLenSlice[i])
+	}
+	needShapes := 8 * totalShape
+	if len(data) < p+needShapes {
+		return nil, nil, errors.New("raw data too short for shapes")
+	}
+	shapesAll := unsafe.Slice((*int64)(unsafe.Pointer(&data[p])), totalShape)
+	p += needShapes
+
+	// 5) float32 data
+	totalDim := 0
+	for i := 0; i < n; i++ {
+		if dimsSlice[i] < 0 {
+			return nil, nil, errors.New("negative dim in raw data")
+		}
+		totalDim += int(dimsSlice[i])
+	}
+	needFloats := 4 * totalDim
+	if len(data) < p+needFloats {
+		return nil, nil, errors.New("raw data too short for float data")
+	}
+
+	floatBase := (*float32)(unsafe.Pointer(&data[p]))
+
+	floatVecs := make([][]float32, n)
+	shapes := make([][]int64, n)
+
+	shapeOffset := 0
+	floatOffset := 0
+	for i := 0; i < n; i++ {
+		dim := int(dimsSlice[i])
+		shapeLen := int(shapeLenSlice[i])
+
+		// shape[i]
+		shapes[i] = shapesAll[shapeOffset : shapeOffset+shapeLen]
+		shapeOffset += shapeLen
+
+		// 第 i 个向量：从 floatOffset 开始，长度 dim
+		vecPtr := (*float32)(unsafe.Pointer(
+			uintptr(unsafe.Pointer(floatBase)) + uintptr(floatOffset*4),
+		))
+		floatVecs[i] = unsafe.Slice(vecPtr, dim)
+		floatOffset += dim
+	}
+
+	return floatVecs, shapes, nil
+}
+
+func DecodeVectorsFromBytes(data []byte, useQuantization bool) ([][]float32, [][]int64, func(), error) {
+	if useQuantization {
+		vecs, _, shapes, release, err := DequantizeFBGEMM(data)
+		return vecs, shapes, release, err
+	}
+
+	vecs, shapes, err := DecodeRawVectors(data)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return vecs, shapes, nil, nil
+}
+
 // CreateTensorBatchFromGo 构造一个 GPU 上的批量 ORT Tensor（不复制原始 float32 数据）
 func CreateTensorBatchFromGo(gpuID int, data [][]float32, shape []int64) (*ORTTensor, func(), error) {
 	if len(data) == 0 || len(shape) == 0 {
 		return nil, nil, errors.New("empty input")
 	}
 
+	batchSize := len(data)
 	singleLen := len(data[0])
-	// 取消下面的验证，加速
-	for i := 1; i < len(data); i++ {
-		if len(data[i]) != singleLen {
-			return nil, nil, errors.New("inconsistent sample lengths")
+	if batchSize == 0 || singleLen == 0 {
+		return nil, nil, errors.New("invalid data size")
+	}
+
+	// 用 C.malloc 分配 float* 数组，避免 Go slice 里存 Go 指针再传给 C
+	ptrSize := unsafe.Sizeof((*C.float)(nil))
+	ptrsMem := C.malloc(C.size_t(ptrSize) * C.size_t(batchSize))
+	if ptrsMem == nil {
+		return nil, nil, errors.New("malloc for ptrs failed")
+	}
+	// 这个数组只在本次调用内使用，可以在函数结束时释放
+	defer C.free(ptrsMem)
+
+	cPtrArray := (*[1 << 30]*C.float)(ptrsMem)
+
+	for i := 0; i < batchSize; i++ {
+		if data[i] == nil || len(data[i]) == 0 {
+			cPtrArray[i] = nil
+		} else {
+			cPtrArray[i] = (*C.float)(unsafe.Pointer(&data[i][0]))
 		}
 	}
 
-	// 构建 []*C.float 指针数组
-	ptrs := make([]*C.float, len(data))
-	for i := range data {
-		ptrs[i] = (*C.float)(unsafe.Pointer(&data[i][0]))
-	}
-	cPtrs := (**C.float)(unsafe.Pointer(&ptrs[0]))
+	cPtrs := (**C.float)(ptrsMem)
 	cShape := (*C.int64_t)(unsafe.Pointer(&shape[0]))
 	cShapeLen := C.size_t(len(shape))
 	cSingleLen := C.size_t(singleLen)
-	cBatchSize := C.int(len(data))
+	cBatchSize := C.int(batchSize)
 
 	out := C.ORT_CreateTensorBatch(
 		C.int(gpuID),
@@ -254,11 +407,78 @@ func CreateTensorBatchFromGo(gpuID int, data [][]float32, shape []int64) (*ORTTe
 	if out == nil {
 		return nil, nil, errors.New("ORT_CreateTensorBatch failed")
 	}
+
 	releaseFunc := func() {
 		C.ORT_ReleaseTensor(out)
 	}
 
 	return out, releaseFunc, nil
+}
+
+// CreateGraphInputBatchFromGo 将某个输入 index 的整个 batch 上传到
+// graph slot 管理的固定 GPU 缓冲区中。
+func CreateGraphInputBatchFromGo(
+	sess *ORTSession,
+	pingIndex int,
+	inputIndex int,
+	data [][]float32,
+	shape []int64,
+) (*ORTTensor, error) {
+	if sess == nil {
+		return nil, errors.New("nil session")
+	}
+	if len(data) == 0 || len(shape) == 0 {
+		return nil, errors.New("empty input")
+	}
+
+	batchSize := len(data)
+	singleLen := len(data[0])
+	if batchSize == 0 || singleLen == 0 {
+		return nil, errors.New("invalid data size")
+	}
+
+	// 同样使用 C.malloc 分配 float* 数组，避免 Go slice 的指针被直接传入 C
+	ptrSize := unsafe.Sizeof((*C.float)(nil))
+	ptrsMem := C.malloc(C.size_t(ptrSize) * C.size_t(batchSize))
+	if ptrsMem == nil {
+		return nil, errors.New("malloc for graph input ptrs failed")
+	}
+	defer C.free(ptrsMem)
+
+	cPtrArray := (*[1 << 30]*C.float)(ptrsMem)
+	for i := range batchSize {
+		if data[i] == nil || len(data[i]) == 0 {
+			cPtrArray[i] = nil
+		} else {
+			cPtrArray[i] = (*C.float)(unsafe.Pointer(&data[i][0]))
+		}
+	}
+
+	cPtrs := (**C.float)(ptrsMem)
+	cShape := (*C.int64_t)(unsafe.Pointer(&shape[0]))
+	cShapeLen := C.size_t(len(shape))
+
+	cBatchSize := C.int(batchSize)
+	cSingleLen := C.size_t(singleLen)
+	cPing := C.int(pingIndex)
+	cInputIndex := C.int(inputIndex)
+
+	out := C.ORT_CreateOrUpdateGraphInput(
+		sess,
+		cPing,
+		cInputIndex,
+		cPtrs,
+		cBatchSize,
+		cSingleLen,
+		cShape,
+		cShapeLen,
+	)
+	if out == nil {
+		return nil, errors.New("ORT_CreateOrUpdateGraphInput failed")
+	}
+
+	// 返回的 ORTTensor 属于 session/graph 管理，不需要每批释放
+	return out, nil
 }
 
 // GetTensorDataUnsafeSliceBatched 返回 [][]float32 和 shape（按 batch 拆分），无复制，需释放
@@ -312,4 +532,16 @@ func GetTensorDataUnsafeSliceBatched(tensor *ORTTensor) ([][]float32, []int64, f
 	}
 
 	return result, shape, release, nil
+}
+
+// SetSessionCUDAGraphEnabled 启用 / 禁用某个 session 的 CUDA graph 管理
+func SetSessionCUDAGraphEnabled(sess *ORTSession, enabled bool) {
+	if sess == nil {
+		return
+	}
+	flag := C.int(0)
+	if enabled {
+		flag = 1
+	}
+	C.ORT_SetCudaGraphEnabled(sess, flag)
 }

@@ -37,6 +37,8 @@ type workerBatch struct {
 	maxBS      int
 	bs         int
 
+	finalBS int // StartInfer 带来的最终批大小；0 表示尚未收到
+
 	ortTensors              []*ORTTensor
 	releaseFuncsBeforeInfer []func()
 	releaseFuncsAfterInfer  []func()
@@ -48,7 +50,7 @@ type workerBatch struct {
 
 	releaseMu sync.Mutex
 
-	targetAction chan []int32
+	targetAction []chan pb.TargetAction
 	targetIP     []string
 	targetTag    []uint32
 
@@ -56,7 +58,13 @@ type workerBatch struct {
 	startInferTime        float64
 	finishInferTime       float64
 	finishPostProcessTime float64
-	sendTime              float64
+
+	originalBatch      []*workerBatch // 开启autoMergeBatch后，每个请求对应的原batch
+	seqInOriginalBatch []int          // 开启autoMergeBatch后，每个请求对应的位于原batch的序号
+
+	// 仅在 useCUDAGraph = true 时有效：
+	// 0 或 1，表示当前 batch 绑定到哪一套 Graph slot（ping / pong）
+	graphPingIndex int
 }
 
 func NewWorkerBatch(req *pb.SetTargetRequest) *workerBatch {
@@ -64,12 +72,14 @@ func NewWorkerBatch(req *pb.SetTargetRequest) *workerBatch {
 		id:         req.GetBatchId(),
 		idOnDevice: req.GetBatchId() + "-" + xid.New().String(),
 		modelID:    req.GetStageId(),
-		datas:      make([][]byte, req.GetMaxBs())[:0],
-		reqIDs:     make([]string, req.GetMaxBs())[:0],
+		datas:      make([][]byte, 0, req.GetMaxBs()),
+		reqIDs:     make([]string, 0, req.GetMaxBs()),
 		maxBS:      int(req.GetMaxBs()),
 		rt:         float64(req.GetRt()),
 
-		targetAction: make(chan []int32, 1),
+		targetAction: make([]chan pb.TargetAction, req.GetMaxBs()),
+		targetIP:     make([]string, req.GetMaxBs()),
+		targetTag:    make([]uint32, req.GetMaxBs()),
 
 		requestTimes: make([]WorkerRequestTime, req.GetMaxBs()),
 	}
@@ -77,70 +87,34 @@ func NewWorkerBatch(req *pb.SetTargetRequest) *workerBatch {
 	return b
 }
 
-func (a *workerBatch) Less(b btree.Item) bool {
-	if a.rt == b.(*workerBatch).rt {
-		return a.id < b.(*workerBatch).id
+func (a *workerBatch) Less(ib btree.Item) bool {
+	b := ib.(*workerBatch)
+	if a.rt != b.rt {
+		return a.rt < b.rt
 	}
-	return a.rt < b.(*workerBatch).rt
+	return a.idOnDevice < b.idOnDevice
 }
 
 func (batch *workerBatch) isFull() bool {
 	return batch.bs >= batch.maxBS
 }
 
-func (batch *workerBatch) toDevice(deviceID int) {
-	log.Printf("batch %s start to load on device %d", batch.idOnDevice, deviceID)
-	batch.loadMu.Lock()
-	defer batch.loadMu.Unlock()
-	if batch.loaded && !batch.loadFailed {
-		return
+func (batch *workerBatch) addReq(reqID string, data []byte, originalBatch *workerBatch, originalSeq int) {
+	batch.reqIDs[batch.bs] = reqID
+	batch.datas[batch.bs] = data
+	batch.originalBatch[batch.bs] = originalBatch
+	batch.seqInOriginalBatch[batch.bs] = originalSeq
+	if batch.targetAction[batch.bs] == nil {
+		batch.targetAction[batch.bs] = make(chan pb.TargetAction, 1)
 	}
-	var dataBatch [][][]float32
-	var shapeBatch [][]int64
-	// 解量化
-	for i, data := range batch.datas {
-		tensors, _, shapes, releaseFunc, err := DequantizeFBGEMM(data)
-		batch.releaseFuncsBeforeInfer = append(batch.releaseFuncsBeforeInfer, releaseFunc)
-		if err != nil {
-			log.Printf("ERROR: Dequantize error of batch %s: %v", batch.idOnDevice, err)
-			batch.loaded = true
-			batch.loadFailed = true
-			batch.loadCond.Broadcast()
-			return
-		}
-		if i == 0 {
-			dataBatch = make([][][]float32, len(tensors))
-			for j := range len(tensors) {
-				dataBatch[j] = make([][]float32, batch.bs)
-			}
-			shapeBatch = shapes
-			for j := range len(shapeBatch) {
-				shapeBatch[j][0] = int64(batch.bs)
-			}
-		}
-		for j, d := range tensors {
-			dataBatch[j][i] = d // 指针复制，基本没开销
-		}
-	}
-	// 转成 ORTTensor 切片
-	batch.ortTensors = make([]*ORTTensor, len(dataBatch))
-	for i, data := range dataBatch {
-		t, releaseFunc, err := CreateTensorBatchFromGo(deviceID, data, shapeBatch[i])
-		batch.releaseFuncsBeforeInfer = append(batch.releaseFuncsBeforeInfer, releaseFunc)
-		if err != nil {
-			log.Printf("ERROR: Create ort tensor error of batch %s: %v", batch.idOnDevice, err)
-			batch.loaded = true
-			batch.loadFailed = true
-			batch.loadCond.Broadcast()
-			return
-		}
-		batch.ortTensors[i] = t
-	}
+	batch.bs++
+}
 
-	batch.loaded = true
-	batch.loadFailed = false
-	log.Printf("batch %s finish to load on device %d", batch.idOnDevice, deviceID)
-	batch.loadCond.Broadcast()
+func (batch *workerBatch) getOriginalBS() int {
+	if batch.finalBS == 0 {
+		return batch.bs
+	}
+	return batch.finalBS
 }
 
 func (batch *workerBatch) releaseBeforeInfer() {
@@ -205,10 +179,26 @@ type GPUWorker struct {
 	finishBatchStub pb.FinishBatchServiceClient
 	sendData        SendFuncType
 
-	debug bool
+	// 仅在 useCUDAGraph = true 时使用：
+	// 简单的 ping-pong 分配器，每次调用在 0 和 1 之间切换
+	graphPingMu   sync.Mutex
+	nextGraphPing int
+
+	useQuantization   bool // 是否开启输入输出的解量化和量化
+	followServerBatch bool // 是否严格按 server 批
+	autoMergeBatch    bool // 是否自动合并小批，只有在 followServerBatch 开启后才有效，否则会出bug
+	fixedMaxBatch     bool // 是否保证每次推理都是推固定的最大batchsize，以避免模型切换的开销
+	useCUDAGraph      bool // 是否使用 CUDA Graph 减少batchsize切换的影响
+	debug             bool
 }
 
-func NewGPUWorker(deviceID int, rank int, getTargetStub pb.GetTargetDeviceServiceClient, finishInferStub pb.FinishInferServiceClient, finishBatchStub pb.FinishBatchServiceClient, sendData SendFuncType, debug bool) *GPUWorker {
+func NewGPUWorker(deviceID int, rank int, getTargetStub pb.GetTargetDeviceServiceClient, finishInferStub pb.FinishInferServiceClient,
+	finishBatchStub pb.FinishBatchServiceClient, sendData SendFuncType, debug bool, followServerBatch bool, autoMergeBatch bool,
+	fixedMaxBatch bool, useCUDAGraph bool, useQuantization bool) *GPUWorker {
+	if useCUDAGraph && fixedMaxBatch {
+		log.Printf("[GPU %d] useCUDAGraph is enabled, force fixedMaxBatch = false", deviceID)
+		fixedMaxBatch = false
+	}
 	w := &GPUWorker{
 		deviceIDOnMachine: deviceID,
 		rank:              rank,
@@ -222,10 +212,32 @@ func NewGPUWorker(deviceID int, rank int, getTargetStub pb.GetTargetDeviceServic
 		finishBatchStub: finishBatchStub,
 		sendData:        sendData,
 
+		followServerBatch: followServerBatch,
+		autoMergeBatch:    autoMergeBatch,
+		fixedMaxBatch:     fixedMaxBatch,
+		useCUDAGraph:      useCUDAGraph,
+		useQuantization:   useQuantization,
+
 		debug: debug,
 	}
 	w.inferCond = sync.NewCond(&w.readyToInferQueueMu)
 	return w
+}
+
+// only used when useCUDAGraph == true
+func (w *GPUWorker) nextPingIndex() int {
+	w.graphPingMu.Lock()
+	defer w.graphPingMu.Unlock()
+
+	idx := w.nextGraphPing
+	if idx != 0 && idx != 1 {
+		// 兜底，防止以后不小心改坏
+		idx = 0
+	}
+
+	// 简单在 0 / 1 之间切换
+	w.nextGraphPing = 1 - idx
+	return idx
 }
 
 func (w *GPUWorker) getBatch(batchID string) *workerBatch {
@@ -234,6 +246,247 @@ func (w *GPUWorker) getBatch(batchID string) *workerBatch {
 		return nil
 	}
 	return val.(*workerBatch)
+}
+
+// 创建或获取 batch；若不存在则创建“占位批”
+func (w *GPUWorker) getOrCreateBatchLocked(batchID string) *workerBatch {
+	b := w.getBatch(batchID)
+	if b != nil {
+		return b
+	}
+	// 不存在，新建
+	b = &workerBatch{
+		id:         batchID,
+		idOnDevice: batchID + "-" + xid.New().String(),
+		rt:         0, // 没有 rt 也无所谓：不可推理时不会被取走
+		maxBS:      0, // 等首条 SetTarget 再补
+		bs:         0,
+		finalBS:    0,
+	}
+	b.loadCond = sync.NewCond(&b.loadMu)
+
+	w.batchs.Store(batchID, b)
+	return b
+}
+
+func (w *GPUWorker) SetFinalBS(batchID string, final int) {
+	w.readyToInferQueueMu.Lock()
+	defer w.readyToInferQueueMu.Unlock()
+
+	b := w.getOrCreateBatchLocked(batchID)
+	// 赋值/覆写 finalBS（一般不会变化；若变化按最新为准）
+	b.finalBS = final
+	// w.readyToInferQueue.ReplaceOrInsert(b) // 这里不insert，反正后面还会改的
+
+	// 如果已经收齐，升级为可推理并重排
+	w.CheckAutoMerge(b)
+}
+
+func sameModelChain(a, b *workerBatch) bool {
+	if len(a.modelID) != len(b.modelID) {
+		return false
+	}
+	for i := range a.modelID {
+		if a.modelID[i] != b.modelID[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (w *GPUWorker) toDevice(batch *workerBatch, deviceID int) {
+	log.Printf("batch %s start to load on device %d", batch.idOnDevice, deviceID)
+
+	batch.loadMu.Lock()
+	defer batch.loadMu.Unlock()
+
+	// 已经成功加载过就不重复
+	if batch.loaded && !batch.loadFailed {
+		return
+	}
+
+	var dataBatch [][][]float32
+	var shapeBatch [][]int64
+
+	// 解码（量化 / 非量化）
+	for i := range batch.bs {
+		data := batch.datas[i]
+
+		tensors, shapes, releaseFunc, err := DecodeVectorsFromBytes(data, w.useQuantization)
+		if releaseFunc != nil {
+			batch.releaseFuncsBeforeInfer = append(batch.releaseFuncsBeforeInfer, releaseFunc)
+		}
+		if err != nil {
+			log.Printf("ERROR: decode input error of batch %s: %v", batch.idOnDevice, err)
+			batch.loaded = true
+			batch.loadFailed = true
+			batch.loadCond.Broadcast()
+			return
+		}
+
+		// 初始化 dataBatch / shapeBatch
+		if dataBatch == nil {
+			dataBatch = make([][][]float32, len(tensors))
+			for j := range dataBatch {
+				if w.fixedMaxBatch {
+					dataBatch[j] = make([][]float32, batch.maxBS)
+				} else {
+					dataBatch[j] = make([][]float32, batch.bs)
+				}
+			}
+			shapeBatch = shapes
+			for j := range shapeBatch {
+				if w.fixedMaxBatch {
+					shapeBatch[j][0] = int64(batch.maxBS)
+				} else {
+					shapeBatch[j][0] = int64(batch.bs)
+				}
+			}
+		}
+
+		// 填入第 i 个样本的各个输入向量（只是 slice 指针赋值，不复制数据）
+		for j, d := range tensors {
+			dataBatch[j][i] = d
+		}
+	}
+
+	// 空 batch 的兜底（理论上不会发生）
+	if len(dataBatch) == 0 {
+		batch.loaded = true
+		batch.loadFailed = false
+		batch.loadCond.Broadcast()
+		return
+	}
+
+	// fixedMaxBatch 下，如果本批样本数小于 maxBS，尾部补 nil，作为哨兵
+	if w.fixedMaxBatch && batch.bs < batch.maxBS {
+		for j := range dataBatch {
+			for k := batch.bs; k < batch.maxBS; k++ {
+				dataBatch[j][k] = nil
+			}
+		}
+	}
+
+	// =========================
+	//  分支一：CUDA Graph 模式
+	// =========================
+	if w.useCUDAGraph {
+		// 约定：开启 CUDA Graph 的情况下只有单阶段模型
+		if len(batch.modelID) == 0 {
+			log.Printf("ERROR: batch %s has no modelID for CUDA Graph", batch.idOnDevice)
+			batch.loaded = true
+			batch.loadFailed = true
+			batch.loadCond.Broadcast()
+			return
+		}
+		modelID := batch.modelID[0]
+
+		w.sessionLock.RLock()
+		session, ok := w.sessions[modelID]
+		w.sessionLock.RUnlock()
+		if !ok || session == nil {
+			log.Printf("ERROR: model %s not loaded for CUDA Graph on device %d", modelID, w.deviceIDOnMachine)
+			batch.loaded = true
+			batch.loadFailed = true
+			batch.loadCond.Broadcast()
+			return
+		}
+
+		// 分配 ping–pong 槽，并记录到 batch 上
+		ping := w.nextPingIndex()
+		batch.graphPingIndex = ping
+
+		// 对每个输入 index 调用 CreateGraphInputBatchFromGo
+		for inputIndex := range dataBatch {
+			_, err := CreateGraphInputBatchFromGo(
+				session,
+				ping,
+				inputIndex,
+				dataBatch[inputIndex],
+				shapeBatch[inputIndex],
+			)
+			if err != nil {
+				log.Printf("ERROR: CreateGraphInputBatchFromGo error for batch %s, input %d: %v", batch.idOnDevice, inputIndex, err)
+				batch.loaded = true
+				batch.loadFailed = true
+				batch.loadCond.Broadcast()
+				return
+			}
+		}
+
+		batch.loaded = true
+		batch.loadFailed = false
+		log.Printf("batch %s finish to load (CUDA Graph) on device %d ping %d", batch.idOnDevice, deviceID, ping)
+		batch.loadCond.Broadcast()
+		return
+	}
+
+	// =========================
+	//  分支二：非 CUDA Graph 模式（原逻辑）
+	// =========================
+	batch.ortTensors = make([]*ORTTensor, len(dataBatch))
+	for i := range dataBatch {
+		data := dataBatch[i]
+		t, releaseFunc, err := CreateTensorBatchFromGo(deviceID, data, shapeBatch[i])
+		if releaseFunc != nil {
+			batch.releaseFuncsBeforeInfer = append(batch.releaseFuncsBeforeInfer, releaseFunc)
+		}
+		if err != nil {
+			log.Printf("ERROR: Create ort tensor error of batch %s: %v", batch.idOnDevice, err)
+			batch.loaded = true
+			batch.loadFailed = true
+			batch.loadCond.Broadcast()
+			return
+		}
+		batch.ortTensors[i] = t
+	}
+
+	batch.loaded = true
+	batch.loadFailed = false
+	log.Printf("batch %s finish to load on device %d", batch.idOnDevice, deviceID)
+	batch.loadCond.Broadcast()
+}
+
+// 需要申请 w.readyToInferQueueMu 锁
+func (w *GPUWorker) CheckAutoMerge(batch *workerBatch) {
+	if w.followServerBatch && batch.finalBS > 0 {
+		// 检查是否即收到了所有请求数据又收到了运行推理的控制信号或者已经满编
+		// TODO：往已有batch里补满这个过程并没有考虑rt优先级的问题
+		if (batch.finalBS > 0 && batch.bs >= batch.finalBS) || batch.bs >= batch.maxBS {
+			if w.autoMergeBatch {
+				i := batch.bs - 1
+				w.readyToInferQueue.Ascend(func(it btree.Item) bool {
+					b := it.(*workerBatch)
+					// 目标batch也得是finalBS不为0的开启了follow的，如果是没开启follow的，那会影响scheduler判断
+					if b != batch && b.finalBS != 0 && !b.isFull() && sameModelChain(b, batch) {
+						for ; i >= 0 && !b.isFull(); i-- {
+							b.addReq(batch.reqIDs[i], batch.datas[i], batch, i)
+							batch.bs--
+							if w.debug {
+								// 转移debug信息
+								b.requestTimes[b.bs-1].recvTime = batch.requestTimes[batch.bs].recvTime
+								b.requestTimes[b.bs-1].startQueueingTime = batch.requestTimes[batch.bs].startQueueingTime
+							}
+							log.Printf("automerge: req to other batch: %s -> %s", batch.reqIDs[i], b.idOnDevice)
+						}
+					}
+					return i >= 0
+				})
+			}
+			// 没开启w.autoMergeBatch或者还剩下没分完的请求
+			if batch.bs > 0 {
+				log.Printf("batch ready to infer: %s", batch.idOnDevice)
+				w.readyToInferQueue.ReplaceOrInsert(batch)
+				w.inferCond.Broadcast()
+			}
+		}
+	}
+	// 没开启w.followServerBatch
+	if !w.followServerBatch && batch.bs > 0 {
+		log.Printf("batch ready to infer: %s", batch.idOnDevice)
+		w.readyToInferQueue.ReplaceOrInsert(batch)
+		w.inferCond.Broadcast()
+	}
 }
 
 func (w *GPUWorker) AddReqToBatchInReadyToInferQueue(req *pb.SetTargetRequest, data []byte) {
@@ -245,40 +498,55 @@ func (w *GPUWorker) AddReqToBatchInReadyToInferQueue(req *pb.SetTargetRequest, d
 	w.readyToInferQueueMu.Lock()
 	defer w.readyToInferQueueMu.Unlock()
 
-	batch := w.getBatch(req.GetBatchId())
-	if batch == nil {
+	batch := w.getOrCreateBatchLocked(req.GetBatchId())
+	if batch.bs == 0 {
 		// if req.GetRt() > float32(time.Now().UnixMicro())/1000 {
 		// 	// 超时丢弃 ！！不能直接丢弃，会导致scheduler以为一直在推理！！
 		// 	log.Printf("req %s of batch %s timeout, discard", req.RequestId, req.GetBatchId())
 		// 	return
 		// }
-		// 到达这一步说明要么是一个新任务，要么这个任务已经被推理完了
-		batch = NewWorkerBatch(req)
+		// 到达这一步说明要么是一个新任务，要么这个任务已经被推理完了（非followServerBatch模式下）
+		batch.modelID = req.GetStageId()
+		batch.datas = make([][]byte, req.GetMaxBs())
+		batch.reqIDs = make([]string, req.GetMaxBs())
+		batch.originalBatch = make([]*workerBatch, req.GetMaxBs())
+		batch.seqInOriginalBatch = make([]int, req.GetMaxBs())
+		batch.targetAction = make([]chan pb.TargetAction, req.GetMaxBs())
+		batch.targetIP = make([]string, req.GetMaxBs())
+		batch.targetTag = make([]uint32, req.GetMaxBs())
+		batch.maxBS = int(req.GetMaxBs())
+		batch.rt = float64(req.GetRt())
+		batch.requestTimes = make([]WorkerRequestTime, req.GetMaxBs())
 
 		log.Printf("creating new batch %s with req %s of stage %s and rt %s", batch.idOnDevice, req.RequestId, req.StageId, getTimeStr(batch.rt))
-		batch.reqIDs = append(batch.reqIDs, req.GetRequestId())
-		batch.bs++
-		batch.datas = append(batch.datas, data)
+		batch.addReq(req.GetRequestId(), data, batch, batch.bs)
 
-		w.batchs.Store(batch.id, batch)
-		w.readyToInferQueue.ReplaceOrInsert(batch)
-		w.inferCond.Broadcast()
+		if !w.followServerBatch || !req.GetFollowServerInfer() {
+			w.readyToInferQueue.ReplaceOrInsert(batch) // 如果不是followServerBatch模式则不插入，因为并没有准备推理，得等后面判断
+			w.inferCond.Broadcast()
+		}
 	} else {
 		log.Printf("adding req %s to existing batch %s", req.RequestId, batch.idOnDevice)
-		batch.reqIDs = append(batch.reqIDs, req.GetRequestId())
-		batch.bs++
-		batch.datas = append(batch.datas, data)
+		batch.addReq(req.GetRequestId(), data, batch, batch.bs)
 		if batch.rt > float64(req.GetRt())+worker_epsilon { // 需要更新rt
-			w.readyToInferQueue.Delete(batch)
-			batch.rt = float64(req.Rt)
-			w.readyToInferQueue.ReplaceOrInsert(batch)
-			log.Printf("updating batch %s rt to %s", batch.idOnDevice, getTimeStr(batch.rt))
+			if !w.followServerBatch || !req.GetFollowServerInfer() {
+				w.readyToInferQueue.Delete(batch)
+			}
+			batch.rt = float64(req.GetRt())
+			if !w.followServerBatch || !req.GetFollowServerInfer() {
+				w.readyToInferQueue.ReplaceOrInsert(batch)
+			}
+			log.Printf("updating batch rt of %s to %s", batch.idOnDevice, getTimeStr(batch.rt))
 		}
 	}
+
+	// 记录新请求的debug信息
 	if w.debug {
 		batch.requestTimes[batch.bs-1].recvTime = tRecv
 		batch.requestTimes[batch.bs-1].startQueueingTime = getTime()
 	}
+
+	w.CheckAutoMerge(batch)
 }
 
 func (w *GPUWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
@@ -306,6 +574,9 @@ func (w *GPUWorker) modelControlLoop(ctx context.Context, wg *sync.WaitGroup) {
 				if err != nil {
 					log.Printf("[GPU %d] load Model %s error", w.deviceIDOnMachine, modelID)
 					continue
+				}
+				if w.useCUDAGraph {
+					SetSessionCUDAGraphEnabled(sess, true)
 				}
 				w.sessionLock.Lock()
 				w.sessions[modelID] = sess
@@ -362,9 +633,12 @@ func (w *GPUWorker) postProcess(batch *workerBatch, ortResults []*ORTTensor) {
 				errCh <- fmt.Errorf("quantize result of batch %s error: %v", batch.idOnDevice, err)
 				return
 			}
-
+			// 把结果放回原来存数据的位置，不放回原batch的原位置，因为原batch可能存有新的还没推理的数据（即代理了其它batch）
 			batch.addReleaseFuncAfterInfer(f)
 			batch.datas[i] = data
+			// ob := batch.originalBatch[i]
+			// ob.addReleaseFuncAfterInfer(f)
+			// ob.datas[batch.seqInOriginalBatch[i]] = data
 		}()
 	}
 
@@ -378,17 +652,16 @@ func (w *GPUWorker) postProcess(batch *workerBatch, ortResults []*ORTTensor) {
 	if w.debug {
 		batch.finishPostProcessTime = getTime()
 	}
-	//结果转发
-	actions := <-batch.targetAction
 
-	for i, act := range actions {
-		if act == int32(pb.TargetAction_DISCARD) {
-			continue
-		}
+	//结果转发
+	for i := range batch.bs {
 		wg.Add(1)
-		if act == int32(pb.TargetAction_FINISH) {
-			go func() {
-				defer wg.Done()
+		go func(i int) {
+			defer wg.Done()
+			act := <-batch.targetAction[i]
+			if act == pb.TargetAction_DISCARD {
+				return
+			} else if act == pb.TargetAction_FINISH {
 				rpcReq := &pb.FinishInferRequest{
 					RequestId: batch.reqIDs[i],
 					Tensors:   batch.datas[i],
@@ -409,20 +682,25 @@ func (w *GPUWorker) postProcess(batch *workerBatch, ortResults []*ORTTensor) {
 				if err != nil {
 					log.Printf("req %s of batch %s finish infer error: %v", batch.reqIDs[i], batch.idOnDevice, err)
 				}
-			}()
-		}
-		if act == int32(pb.TargetAction_FORWARD) {
-			go func() {
-				defer wg.Done()
+			} else if act == pb.TargetAction_FORWARD {
 				if w.debug {
 					batch.requestTimes[i].sendTime = getTime()
 				}
 				w.sendData(batch.targetIP[i], batch.targetTag[i], batch.datas[i])
-			}()
-		}
+			}
+		}(i)
 	}
 	wg.Wait()
 	w.finishBatch(batch)
+
+	// var lastBatch *workerBatch
+	// for _, b := range batch.originalBatch {
+	// 	if b != lastBatch {
+	// 		lastBatch = b
+	// 		b.agentWG.Done()
+	// 		go w.finishBatch(b)
+	// 	}
+	// }
 }
 
 func (w *GPUWorker) inferBatch(batch *workerBatch) error {
@@ -435,76 +713,199 @@ func (w *GPUWorker) inferBatch(batch *workerBatch) error {
 		batch.loadMu.Unlock()
 		return errors.New("ERROR: batch load failed")
 	}
-	log.Printf("batch %s start to infer stages %s on device %d", batch.idOnDevice, fmt.Sprint(batch.modelID), w.deviceIDOnMachine)
+	log.Printf(
+		"batch %s start to infer stages %s on device %d",
+		batch.idOnDevice,
+		fmt.Sprint(batch.modelID),
+		w.deviceIDOnMachine,
+	)
 
+	batch.startInferTime = getTime()
+
+	// =========================
+	//  分支一：CUDA Graph 模式（单阶段）
+	// =========================
+	if w.useCUDAGraph {
+		if len(batch.modelID) == 0 {
+			batch.loadMu.Unlock()
+			return fmt.Errorf("ERROR: no modelID for batch %s", batch.idOnDevice)
+		}
+		modelID := batch.modelID[0]
+
+		w.sessionLock.RLock()
+		session, ok := w.sessions[modelID]
+		w.sessionLock.RUnlock()
+		if !ok || session == nil {
+			batch.loadMu.Unlock()
+			return fmt.Errorf("ERROR: model %s not loaded on device %d",
+				modelID, w.deviceIDOnMachine)
+		}
+
+		log.Printf(
+			"batch %s start to infer (CUDA Graph) model %s on device %d, bs=%d, ping=%d",
+			batch.idOnDevice,
+			modelID,
+			w.deviceIDOnMachine,
+			batch.bs,
+			batch.graphPingIndex,
+		)
+
+		// Graph 视角下的 batch size，这里直接使用实际 batch.bs
+		// 这样不同的 bs 会对应不同的 GraphSlot（按需捕获 / 复用）
+
+		ortResults, err := RunInferenceWithGraphSlot(
+			session,
+			int64(batch.bs),
+			batch.graphPingIndex,
+		)
+		if err != nil {
+			batch.loadMu.Unlock()
+			return fmt.Errorf("ERROR: RunInferenceWithGraphSlot failed for batch %s: %w",
+				batch.idOnDevice, err)
+		}
+
+		batch.finishInferTime = getTime()
+		batch.loadMu.Unlock()
+
+		// Graph 输出是 session 持有的 ORTTensor*，直接送去后处理
+		go w.postProcess(batch, ortResults)
+		return nil
+	}
+
+	// =========================
+	//  分支二：非 CUDA Graph 模式（原逻辑，多阶段）
+	// =========================
 	ortResults := batch.ortTensors
 	var f func()
 	var err error
-	batch.startInferTime = getTime()
+
 	for _, mID := range batch.modelID {
+		w.sessionLock.RLock()
 		session, ok := w.sessions[mID]
-		if !ok {
+		w.sessionLock.RUnlock()
+		if !ok || session == nil {
 			batch.loadMu.Unlock()
-			return errors.New(fmt.Sprintf("ERROR: model not loaded on device %d", w.deviceIDOnMachine))
+			return fmt.Errorf("ERROR: model %s not loaded on device %d", mID, w.deviceIDOnMachine)
 		}
-		// 记录请求开始推理的时间
-		log.Printf("batch %s start to infer stage %s on device %d", batch.idOnDevice, mID, w.deviceIDOnMachine)
-		ortResults, f, err = RunInferenceFixedOutput(session, ortResults, int64(batch.bs))
-		log.Printf("batch %s finish infering stage %s on device %d", batch.idOnDevice, mID, w.deviceIDOnMachine)
-		batch.addReleaseFuncAfterInfer(f)
+
+		if w.fixedMaxBatch {
+			log.Printf(
+				"batch %s start to infer stage %s on device %d, with bs %d (fixedMaxBatch %d)",
+				batch.idOnDevice, mID, w.deviceIDOnMachine, batch.bs, batch.maxBS,
+			)
+			ortResults, f, err = RunInferenceFixedOutput(session, ortResults, int64(batch.maxBS))
+		} else {
+			log.Printf(
+				"batch %s start to infer stage %s on device %d, with bs %d",
+				batch.idOnDevice, mID, w.deviceIDOnMachine, batch.bs,
+			)
+			ortResults, f, err = RunInferenceFixedOutput(session, ortResults, int64(batch.bs))
+		}
+
+		if f != nil {
+			batch.addReleaseFuncAfterInfer(f)
+		}
 		if err != nil {
+			batch.loadMu.Unlock()
 			return err
 		}
 	}
-	batch.finishInferTime = getTime()
 
+	batch.finishInferTime = getTime()
 	batch.loadMu.Unlock()
+
 	go w.postProcess(batch, ortResults)
 	return nil
 }
 
 // 目标查询
 func (w *GPUWorker) getTarget(batch *workerBatch) {
-	rpcReq := &pb.GetTargetRequest{
-		Rank:       int32(w.rank),
-		BatchId:    batch.id,
-		RequestIds: batch.reqIDs,
+	// 通过一个循环把请求按原batch分好进行getTarget询问，结果仍放到代理batch中
+	var batchs []*workerBatch
+	var lrb []int // lastReqBorder
+	var lastID string
+	for i := range batch.bs {
+		b := batch.originalBatch[i]
+		if i == 0 || b.idOnDevice != lastID {
+			lastID = b.idOnDevice
+			batchs = append(batchs, b)
+			lrb = append(lrb, i)
+		}
 	}
-	resp, err := w.getTargetStub.GetTarget(context.Background(), rpcReq)
-	if err != nil {
-		log.Printf("get target of batch %s error: %v", batch.idOnDevice, err)
-		batch.targetAction <- nil // 丢弃batch
-		return
+	lrb = append(lrb, batch.bs)
+	for i, b := range batchs {
+		go func(i int, b *workerBatch) {
+			rpcReq := &pb.GetTargetRequest{
+				BatchId:    b.id,
+				RequestIds: batch.reqIDs[lrb[i]:lrb[i+1]],
+			}
+			resp, err := w.getTargetStub.GetTarget(context.Background(), rpcReq)
+			if err != nil {
+				log.Printf("get target of batch %s (agent %s) error: %v", b.idOnDevice, batch.idOnDevice, err)
+				// 丢弃batch
+				for j := lrb[i]; j < lrb[i+1]; j++ {
+					// b.targetAction[batch.seqInOriginalBatch[j]] <- pb.TargetAction_DISCARD
+					batch.targetAction[j] <- pb.TargetAction_DISCARD
+				}
+				return
+			}
+			for j := lrb[i]; j < lrb[i+1]; j++ {
+				k := j - lrb[i]
+				// b.targetIP[batch.seqInOriginalBatch[j]] = resp.Ip[k]
+				// b.targetTag[batch.seqInOriginalBatch[j]] = resp.StartTags[k]
+				// b.targetAction[batch.seqInOriginalBatch[j]] <- resp.Action[k]
+				batch.targetIP[j] = resp.Ip[k]
+				batch.targetTag[j] = resp.StartTags[k]
+				batch.targetAction[j] <- resp.Action[k]
+			}
+		}(i, b)
 	}
-	batch.targetIP = resp.GetIp()
-	batch.targetTag = resp.GetStartTags()
-	batch.targetAction <- resp.GetAction()
 }
 
 func (w *GPUWorker) finishBatch(batch *workerBatch) {
-	rpcReq := &pb.FinishBatchRequest{
-		BatchId:    batch.id,
-		RequestIds: batch.reqIDs,
-	}
-	if w.debug {
-		requestTimes := make([]*pb.RequestTime, batch.bs)
-		log.Printf("FinishBatch %s bs: %d, len(rt): %d", batch.idOnDevice, batch.bs, len(batch.requestTimes))
-		for i := range batch.bs {
-			rt := batch.requestTimes[i]
-			requestTimes[i] = &pb.RequestTime{
-				RecvTime:          rt.recvTime,
-				StartQueueingTime: rt.startQueueingTime,
-				SendTime:          rt.sendTime,
-			}
+	// 如果是代理batch，分别finish其中的每一个原batch的部分
+
+	var batchs []*workerBatch
+	var lrb []int // lastReqBorder
+	var lastID string
+	for i := range batch.bs {
+		b := batch.originalBatch[i]
+		if i == 0 || b.idOnDevice != lastID {
+			lastID = b.idOnDevice
+			batchs = append(batchs, b)
+			lrb = append(lrb, i)
 		}
-		rpcReq.RequestTimes = requestTimes
-		rpcReq.StartInferTime = batch.startInferTime
-		rpcReq.FinishInferTime = batch.finishInferTime
-		rpcReq.FinishPostProcessTime = batch.finishPostProcessTime
 	}
-	_, err := w.finishBatchStub.FinishBatch(context.Background(), rpcReq)
-	if err != nil {
-		log.Printf("finish batch of batch %s error: %v", batch.idOnDevice, err)
+	lrb = append(lrb, batch.bs)
+
+	for i, b := range batchs {
+		go func(i int, b *workerBatch) {
+			rpcReq := &pb.FinishBatchRequest{
+				BatchId:    b.id,
+				RequestIds: batch.reqIDs[lrb[i]:lrb[i+1]],
+			}
+			if w.debug {
+				requestTimes := make([]*pb.RequestTime, lrb[i+1]-lrb[i])
+				log.Printf("FinishBatch %s with client %s bs: %d, len(rt): %d", b.idOnDevice, batch.idOnDevice, batch.bs, len(batch.requestTimes))
+				for j := lrb[i]; j < lrb[i+1]; j++ {
+					k := j - lrb[i]
+					rt := batch.requestTimes[j]
+					requestTimes[k] = &pb.RequestTime{
+						RecvTime:          rt.recvTime,
+						StartQueueingTime: rt.startQueueingTime,
+						SendTime:          rt.sendTime,
+					}
+				}
+				rpcReq.RequestTimes = requestTimes
+				rpcReq.StartInferTime = batch.startInferTime
+				rpcReq.FinishInferTime = batch.finishInferTime
+				rpcReq.FinishPostProcessTime = batch.finishPostProcessTime
+			}
+			_, err := w.finishBatchStub.FinishBatch(context.Background(), rpcReq)
+			if err != nil {
+				log.Printf("finish batch of batch %s error: %v", batch.idOnDevice, err)
+			}
+		}(i, b)
 	}
 }
 
@@ -530,19 +931,23 @@ func (w *GPUWorker) inferLoop(ctx context.Context, wg *sync.WaitGroup) {
 				if batchItem != nil {
 					batch = batchItem.(*workerBatch)
 					w.batchs.Delete(batch.id)
-					go batch.toDevice(w.deviceIDOnMachine)
+					go w.toDevice(batch, w.deviceIDOnMachine)
 					go w.getTarget(batch)
 				}
 			}
 
 			if batch != nil {
 				// 检查是否可以预加载下一个
-				if peek := w.readyToInferQueue.Min(); peek != nil && peek.(*workerBatch).isFull() {
-					nextBatch = w.readyToInferQueue.DeleteMin().(*workerBatch)
-					w.batchs.Delete(nextBatch.id)
-					log.Printf("device %d preloading batch %s", w.deviceIDOnMachine, nextBatch.idOnDevice)
-					go nextBatch.toDevice(w.deviceIDOnMachine) // 预加载
-					go w.getTarget(nextBatch)
+				peek := w.readyToInferQueue.Min()
+				if peek != nil {
+					peek := peek.(*workerBatch)
+					if peek.isFull() || peek.bs >= peek.finalBS {
+						nextBatch = w.readyToInferQueue.DeleteMin().(*workerBatch)
+						w.batchs.Delete(nextBatch.id)
+						log.Printf("device %d preloading batch %s", w.deviceIDOnMachine, nextBatch.idOnDevice)
+						go w.toDevice(nextBatch, w.deviceIDOnMachine)
+						go w.getTarget(nextBatch)
+					}
 				}
 				log.Printf(
 					"device %d start infer batch %s with batchsize %d and rt %s and queuelen %d",

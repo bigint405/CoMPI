@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -144,6 +145,73 @@ func processRequest(dataBytes []byte, modelID string, timeout float64) {
 	latencyMu.Unlock()
 }
 
+// 将多个 float32 向量和对应 shape 按 worker 端 DecodeRawVectors 使用的格式打包成 []byte。
+// 格式：int32 numVecs | int32 dims[num] | int32 shapeLens[num] | int64 shapes(flat) | float32 data(flat)
+func encodeRawVectors(vectors [][]float32, shapes [][]int64) ([]byte, error) {
+	n := len(vectors)
+	if n == 0 || len(shapes) != n {
+		return nil, fmt.Errorf("encodeRawVectors: invalid vectors/shapes, n=%d, len(shapes)=%d", n, len(shapes))
+	}
+
+	dims := make([]int32, n)
+	shapeLens := make([]int32, n)
+	totalShape := 0
+	totalFloats := 0
+
+	for i := 0; i < n; i++ {
+		if len(vectors[i]) == 0 {
+			return nil, fmt.Errorf("encodeRawVectors: empty vector at %d", i)
+		}
+		dims[i] = int32(len(vectors[i]))
+		shapeLens[i] = int32(len(shapes[i]))
+		totalShape += len(shapes[i])
+		totalFloats += len(vectors[i])
+	}
+
+	// 预估容量，避免反复扩容：4（numVecs）+4*n(dims)+4*n(shapeLens)+8*totalShape+4*totalFloats
+	buf := &bytes.Buffer{}
+	buf.Grow(4 + 4*n + 4*n + 8*totalShape + 4*totalFloats)
+
+	// 1) numVecs
+	if err := binary.Write(buf, binary.LittleEndian, int32(n)); err != nil {
+		return nil, err
+	}
+
+	// 2) dims[0..n-1]
+	for i := range n {
+		if err := binary.Write(buf, binary.LittleEndian, dims[i]); err != nil {
+			return nil, err
+		}
+	}
+
+	// 3) shapeLens[0..n-1]
+	for i := range n {
+		if err := binary.Write(buf, binary.LittleEndian, shapeLens[i]); err != nil {
+			return nil, err
+		}
+	}
+
+	// 4) shapes flatten，按顺序写入每个 shape[i] 的所有维度
+	for i := range n {
+		for _, v := range shapes[i] {
+			if err := binary.Write(buf, binary.LittleEndian, v); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// 5) float32 data flatten
+	for i := range n {
+		for _, f := range vectors[i] {
+			if err := binary.Write(buf, binary.LittleEndian, f); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
 func percentile(p float64, data []float64) float64 {
 	if len(data) == 0 {
 		return 0
@@ -194,6 +262,8 @@ func main() {
 	distribution := flag.String("d", "n", "分布，g是gamma，p是泊松，n是按次发送（每次发送峰值负载的数据，等都返回了再发送下一次）")
 	cdf_path := flag.String("cdf", "", "cdf图保存路径")
 	latencyPath := flag.String("latency", "", "延迟数据保存路径")
+	useQuant := flag.Bool("quant", false, "是否对输入向量进行 int8 量化（必须与 worker 配置一致）")
+
 	flag.Parse()
 
 	shapes, err := parseShapes(strings.Split(*shapeStr, ";"))
@@ -205,16 +275,30 @@ func main() {
 	for _, shape := range shapes {
 		vectors = append(vectors, generateRandomTensor(shape))
 	}
-	dataBytes, release, err := QuantizeVectorsFBGEMMBytes(vectors, shapes)
+
+	var (
+		dataBytes []byte
+		release   func()
+	)
+
+	if *useQuant {
+		// 量化路径：调用 FBGEMM，得到 int8 编码
+		dataBytes, release, err = QuantizeVectorsFBGEMMBytes(vectors, shapes)
+	} else {
+		// 非量化路径：按 DecodeRawVectors 的格式打包 float32
+		dataBytes, err = encodeRawVectors(vectors, shapes)
+	}
 
 	if err != nil {
-		log.Println("量化失败:", err)
+		log.Println("构造输入数据失败:", err)
 		latencyMu.Lock()
 		failNum++
 		latencyMu.Unlock()
 		return
 	}
-	defer release()
+	if release != nil {
+		defer release()
+	}
 
 	seed := uint64(time.Now().UnixNano())
 	src := rand.NewSource(seed)

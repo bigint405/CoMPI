@@ -7,11 +7,17 @@ import (
 
 type WorkerRpcServer struct {
 	rpc_server.UnimplementedSetTargetDeviceServiceServer
-	// 模型控制命令的tpc接口
+	rpc_server.UnimplementedStartInferServiceServer
+
 	workerManager *WorkerManager
 }
 
 func (s *WorkerRpcServer) SetTarget(ctx context.Context, req *rpc_server.SetTargetRequest) (*rpc_server.SetTargetResponse, error) {
 	s.workerManager.recvSetTargetReq(req)
 	return &rpc_server.SetTargetResponse{Status: 0}, nil
+}
+
+func (s *WorkerRpcServer) StartInfer(ctx context.Context, req *rpc_server.StartInferRequest) (*rpc_server.StartInferResponse, error) {
+	s.workerManager.recvStartInfer(req)
+	return &rpc_server.StartInferResponse{Status: 0}, nil
 }

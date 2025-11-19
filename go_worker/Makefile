@@ -5,6 +5,7 @@ ORT_ROOT := /root/packs/onnxruntime-linux-x64-gpu-1.21.0
 CUDA_ROOT := /usr/local/cuda
 FBGEMM_ROOT := /root/packs/FBGEMM
 FBGEMM_BUILD := $(FBGEMM_ROOT)/build
+ASMJIT_LIB_DIR := $(FBGEMM_BUILD)/asmjit
 
 INCLUDES := -I. -I$(ORT_ROOT)/include -I$(CUDA_ROOT)/include -I$(FBGEMM_ROOT)/include
 LIBS := \
@@ -12,6 +13,7 @@ LIBS := \
     -L$(CUDA_ROOT)/lib64 -lcudart \
     -L$(FBGEMM_BUILD) -lfbgemm \
     -L$(FBGEMM_BUILD)/cpuinfo -lcpuinfo \
+    -L$(ASMJIT_LIB_DIR) -lasmjit \
     -fopenmp
 
 SRC := onnxruntime_cgo.cpp
