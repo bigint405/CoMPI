@@ -10,7 +10,10 @@
 #include <algorithm>
 #include <fbgemm/QuantUtils.h>
 #include <map>
-#include <chrono>
+#include <nvToolsExt.h>
+#include <sstream>
+#include <thread>
+
 struct ORTTensor
 {
     Ort::Value value{nullptr};
@@ -135,7 +138,7 @@ extern "C"
     
             session_options.SetGraphOptimizationLevel(
                 GraphOptimizationLevel::ORT_ENABLE_ALL);
-    
+
             // 创建 Session 和 IoBinding
             ort_session->session = Ort::Session(ort_session->env, model_path, session_options);
             ort_session->io_binding = Ort::IoBinding(ort_session->session);
@@ -762,6 +765,110 @@ extern "C"
         return tensor;
     }
 
+    ORTTensor *ORT_CreateOrUpdateGraphInput_FromUintptr(
+        ORTSession *session,
+        int ping_index,
+        int input_index,
+        const uintptr_t *data_ptrs,  // 每个元素是一个样本的地址（按 uintptr 传进来）
+        int batch_size,
+        size_t single_len,
+        const int64_t *shape,
+        size_t shape_len)
+    {
+        if (!session || !data_ptrs || !shape || shape_len == 0 || batch_size <= 0) {
+            return nullptr;
+        }
+    
+        // 这里不重复写 use_cuda_graph 和合法性检查，直接复用原来的函数逻辑
+        // 只负责把 uintptr_t 转成 const float*
+        std::vector<const float*> ptrs;
+        ptrs.reserve(batch_size);
+        for (int i = 0; i < batch_size; ++i) {
+            uintptr_t u = data_ptrs[i];
+            if (u == 0) {
+                ptrs.push_back(nullptr);  // 对应 Go 侧的 nil 样本
+            } else {
+                ptrs.push_back(reinterpret_cast<const float*>(u));
+            }
+        }
+    
+        // 把真正的工作交给你原来的函数
+        return ORT_CreateOrUpdateGraphInput(
+            session,
+            ping_index,
+            input_index,
+            ptrs.data(),
+            batch_size,
+            single_len,
+            shape,
+            shape_len);
+    }
+    
+
+    static void DebugLogGraphRun(ORTSession* session,
+                                const GraphSlot& slot,
+                                int64_t batch_size_graph,
+                                int ping_index) {
+        std::ostringstream oss;
+        oss << "[DEBUG][GraphRun] tid=" << std::this_thread::get_id()
+            << " session=" << session
+            << " gpu_id=" << session->gpu_id
+            << " gpu_graph_id=" << slot.gpu_graph_id
+            << " batch=" << batch_size_graph
+            << " ping=" << ping_index
+            << "\n";
+
+        // 打印输入
+        const size_t input_count = session->input_names.size();
+        for (size_t i = 0; i < input_count; ++i) {
+            ORTTensor* t = nullptr;
+            if (i < slot.inputs.size()) {
+                t = slot.inputs[i];
+            }
+            oss << "  input[" << i << "] name=" << session->input_names[i];
+            if (!t) {
+                oss << " ptr=null shape=?\n";
+                continue;
+            }
+            // 获取形状
+            Ort::TensorTypeAndShapeInfo info = t->value.GetTensorTypeAndShapeInfo();
+            std::vector<int64_t> shape = info.GetShape();
+
+            oss << " ptr=" << t->device_ptr << " shape=[";
+            for (size_t j = 0; j < shape.size(); ++j) {
+                oss << shape[j];
+                if (j + 1 < shape.size()) oss << ",";
+            }
+            oss << "]\n";
+        }
+
+        // 打印输出
+        const size_t output_count = session->output_names.size();
+        for (size_t i = 0; i < output_count; ++i) {
+            ORTTensor* t = nullptr;
+            if (i < slot.outputs.size()) {
+                t = slot.outputs[i];
+            }
+            oss << "  output[" << i << "] name=" << session->output_names[i];
+            if (!t) {
+                oss << " ptr=null shape=?\n";
+                continue;
+            }
+            Ort::TensorTypeAndShapeInfo info = t->value.GetTensorTypeAndShapeInfo();
+            std::vector<int64_t> shape = info.GetShape();
+
+            oss << " ptr=" << t->device_ptr << " shape=[";
+            for (size_t j = 0; j < shape.size(); ++j) {
+                oss << shape[j];
+                if (j + 1 < shape.size()) oss << ",";
+            }
+            oss << "]\n";
+        }
+
+        std::cerr << oss.str();
+    }
+
+
     // 使用 graph slot 中固定的输入 / 输出内存执行推理。
     //   batch_size_graph – graph 所看到的 batch 维大小 (如 maxBS)
     //   ping_index       – 0 / 1 (ping–pong)
@@ -769,6 +876,11 @@ extern "C"
     // 返回: 持久化输出 ORTTensor* 数组 (长度 = session->output_count)
     ORTTensor **ORT_RunInferenceWithGraphSlot(ORTSession *session, int64_t batch_size_graph, int ping_index)
     {
+        std::string range_name =
+            "RunWithGraphSlot bs=" + std::to_string(batch_size_graph) +
+            " ping=" + std::to_string(ping_index);
+        nvtxRangePushA(range_name.c_str());
+
         try {
             if (!session) return nullptr;
 
@@ -857,33 +969,41 @@ extern "C"
                 slot.gpu_graph_id = std::to_string(graph_id);
 
                 slot.outputs_initialized = true;
+
+                
+                // 绑定输入 / 输出
+                session->io_binding.ClearBoundInputs();
+                session->io_binding.ClearBoundOutputs();
+
+                for (size_t i = 0; i < input_count; ++i) {
+                    session->io_binding.BindInput(
+                        session->input_names[i].c_str(),
+                        slot.inputs[i]->value);
+                }
+
+                for (size_t i = 0; i < slot.outputs.size(); ++i) {
+                    session->io_binding.BindOutput(
+                        session->output_names[i].c_str(),
+                        slot.outputs[i]->value);
+                }
             }
 
-            // 绑定输入 / 输出
-            session->io_binding.ClearBoundInputs();
-            session->io_binding.ClearBoundOutputs();
-
-            for (size_t i = 0; i < input_count; ++i) {
-                session->io_binding.BindInput(
-                    session->input_names[i].c_str(),
-                    slot.inputs[i]->value);
-            }
-
-            for (size_t i = 0; i < slot.outputs.size(); ++i) {
-                session->io_binding.BindOutput(
-                    session->output_names[i].c_str(),
-                    slot.outputs[i]->value);
-            }
 
             // RunOptions: 挂上 gpu_graph_id，交给 ORT 内部做 CUDA graph 缓存
             Ort::RunOptions run_options;
             run_options.SetRunLogVerbosityLevel(0);
             run_options.AddConfigEntry("gpu_graph_id", slot.gpu_graph_id.c_str());
 
+            // DebugLogGraphRun(session, slot, batch_size_graph, ping_index);
+
             session->session.Run(run_options, session->io_binding);
+    
+            nvtxRangePop();
+
             return slot.outputs.data();
         }
         catch (const Ort::Exception &e) {
+            nvtxRangePop();
             std::cerr << "[ORT ERROR][ORT_RunInferenceWithGraphSlot] "
                     << e.what() << std::endl;
             return nullptr;

@@ -178,6 +178,16 @@ extern "C"
         const int64_t *shape,
         size_t shape_len);
 
+    ORTTensor *ORT_CreateOrUpdateGraphInput_FromUintptr(
+        ORTSession *session,
+        int ping_index,
+        int input_index,
+        const uintptr_t *data_ptrs,
+        int batch_size,
+        size_t single_len,
+        const int64_t *shape,
+        size_t shape_len);
+
     ORTTensor **ORT_RunInferenceWithGraphSlot(ORTSession *session, int64_t batch_size_graph, int ping_index);
 
 #ifdef __cplusplus

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"sync"
 
 	"github.com/google/btree"
@@ -183,8 +184,10 @@ type GPUWorker struct {
 
 	// 仅在 useCUDAGraph = true 时使用：
 	// 简单的 ping-pong 分配器，每次调用在 0 和 1 之间切换
-	graphPingMu   sync.Mutex
-	nextGraphPing int
+
+	graphPingMu      sync.Mutex
+	graphPing        map[string]map[int]int           //modelID->batchsize->ping
+	graphPingInferMu map[string]map[int][]*sync.Mutex //modelID->batchsize->ping->mu
 
 	useQuantization   bool // 是否开启输入输出的解量化和量化
 	followServerBatch bool // 是否严格按 server 批
@@ -214,6 +217,9 @@ func NewGPUWorker(deviceID int, rank int, getTargetStub pb.GetTargetDeviceServic
 		finishBatchStub: finishBatchStub,
 		sendData:        sendData,
 
+		graphPing:        make(map[string]map[int]int),
+		graphPingInferMu: make(map[string]map[int][]*sync.Mutex),
+
 		followServerBatch: followServerBatch,
 		autoMergeBatch:    autoMergeBatch,
 		fixedMaxBatch:     fixedMaxBatch,
@@ -227,18 +233,26 @@ func NewGPUWorker(deviceID int, rank int, getTargetStub pb.GetTargetDeviceServic
 }
 
 // only used when useCUDAGraph == true
-func (w *GPUWorker) nextPingIndex() int {
+func (w *GPUWorker) nextPingIndex(batch *workerBatch) int {
 	w.graphPingMu.Lock()
 	defer w.graphPingMu.Unlock()
-
-	idx := w.nextGraphPing
+	m, ok := w.graphPing[batch.modelID[0]]
+	if !ok {
+		m = make(map[int]int)
+		w.graphPing[batch.modelID[0]] = m
+	}
+	idx, ok := m[batch.bs]
+	if !ok {
+		idx = 0
+		m[batch.bs] = idx
+	}
 	if idx != 0 && idx != 1 {
 		// 兜底，防止以后不小心改坏
 		idx = 0
 	}
 
 	// 简单在 0 / 1 之间切换
-	w.nextGraphPing = 1 - idx
+	m[batch.bs] = 1 - idx
 	return idx
 }
 
@@ -395,8 +409,9 @@ func (w *GPUWorker) toDevice(batch *workerBatch, deviceID int) {
 		}
 
 		// 分配 ping–pong 槽，并记录到 batch 上
-		ping := w.nextPingIndex()
+		ping := w.nextPingIndex(batch)
 		batch.graphPingIndex = ping
+		log.Printf("Allocating Ping to batch %s with bs %d and ping %d", batch.idOnDevice, batch.bs, batch.graphPingIndex)
 
 		// 对每个输入 index 调用 CreateGraphInputBatchFromGo
 		for inputIndex := range dataBatch {
@@ -418,7 +433,7 @@ func (w *GPUWorker) toDevice(batch *workerBatch, deviceID int) {
 
 		batch.loaded = true
 		batch.loadFailed = false
-		log.Printf("batch %s finish to load (CUDA Graph) on device %d ping %d", batch.idOnDevice, deviceID, ping)
+		log.Printf("batch %s finish to load (CUDA Graph) on device %d bs %d ping %d", batch.idOnDevice, deviceID, batch.bs, ping)
 		batch.loadCond.Broadcast()
 		return
 	}
@@ -581,7 +596,7 @@ func (w *GPUWorker) modelControlLoop(ctx context.Context, wg *sync.WaitGroup) {
 					SetSessionCUDAGraphEnabled(sess, true)
 					if cmd.WarmUp {
 						w.warmUpMu.Lock()
-						// TODO warmup
+						// TODO warmup。现在的warm up是由用户自己搞与系统无关
 						w.warmUpMu.Unlock()
 					}
 				}
@@ -660,6 +675,11 @@ func (w *GPUWorker) postProcess(batch *workerBatch, ortResults []*ORTTensor) {
 		batch.finishPostProcessTime = getTime()
 	}
 
+	if w.useCUDAGraph {
+		inferMu := w.getInferBatchPingMu(batch)
+		inferMu.Unlock()
+	}
+
 	//结果转发
 	for i := range batch.bs {
 		wg.Add(1)
@@ -699,7 +719,6 @@ func (w *GPUWorker) postProcess(batch *workerBatch, ortResults []*ORTTensor) {
 	}
 	wg.Wait()
 	w.finishBatch(batch)
-
 	// var lastBatch *workerBatch
 	// for _, b := range batch.originalBatch {
 	// 	if b != lastBatch {
@@ -708,6 +727,22 @@ func (w *GPUWorker) postProcess(batch *workerBatch, ortResults []*ORTTensor) {
 	// 		go w.finishBatch(b)
 	// 	}
 	// }
+}
+
+func (w *GPUWorker) getInferBatchPingMu(batch *workerBatch) *sync.Mutex {
+	m, ok := w.graphPingInferMu[batch.modelID[0]]
+	if !ok {
+		m = make(map[int][]*sync.Mutex)
+		w.graphPingInferMu[batch.modelID[0]] = m
+	}
+	mb, ok := m[batch.bs]
+	if !ok {
+		mb = make([]*sync.Mutex, 2)
+		mb[0] = &sync.Mutex{}
+		mb[1] = &sync.Mutex{}
+		m[batch.bs] = mb
+	}
+	return mb[batch.graphPingIndex]
 }
 
 func (w *GPUWorker) inferBatch(batch *workerBatch) error {
@@ -759,7 +794,8 @@ func (w *GPUWorker) inferBatch(batch *workerBatch) error {
 
 		// Graph 视角下的 batch size，这里直接使用实际 batch.bs
 		// 这样不同的 bs 会对应不同的 GraphSlot（按需捕获 / 复用）
-
+		inferMu := w.getInferBatchPingMu(batch)
+		inferMu.Lock()
 		ortResults, err := RunInferenceWithGraphSlot(
 			session,
 			int64(batch.bs),
@@ -918,7 +954,8 @@ func (w *GPUWorker) finishBatch(batch *workerBatch) {
 
 func (w *GPUWorker) inferLoop(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	var nextBatch *workerBatch
 
 	for {

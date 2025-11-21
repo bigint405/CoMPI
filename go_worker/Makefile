@@ -10,7 +10,7 @@ ASMJIT_LIB_DIR := $(FBGEMM_BUILD)/asmjit
 INCLUDES := -I. -I$(ORT_ROOT)/include -I$(CUDA_ROOT)/include -I$(FBGEMM_ROOT)/include
 LIBS := \
     -L$(ORT_ROOT)/lib -lonnxruntime \
-    -L$(CUDA_ROOT)/lib64 -lcudart \
+    -L$(CUDA_ROOT)/lib64 -lcudart -lnvToolsExt \
     -L$(FBGEMM_BUILD) -lfbgemm \
     -L$(FBGEMM_BUILD)/cpuinfo -lcpuinfo \
     -L$(ASMJIT_LIB_DIR) -lasmjit \

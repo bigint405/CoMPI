@@ -2,7 +2,7 @@ package main
 
 /*
 #cgo CXXFLAGS: -std=c++17 -I. -I/root/packs/onnxruntime-linux-x64-gpu-1.21.0/include -I/usr/local/cuda/include -I/root/packs/FBGEMM/include
-#cgo LDFLAGS: -L. -lonnx_cgo -L/root/packs/onnxruntime-linux-x64-gpu-1.21.0/lib -lonnxruntime -L/usr/local/cuda/lib64 -lcudart
+#cgo LDFLAGS: -L. -lonnx_cgo -L/root/packs/onnxruntime-linux-x64-gpu-1.21.0/lib -lonnxruntime -L/usr/local/cuda/lib64 -lcudart -lnvToolsExt
 #include "onnxruntime_cgo.h"
 #include <stdlib.h>
 #include <stdint.h>
@@ -441,24 +441,24 @@ func CreateGraphInputBatchFromGo(
 		return nil, errors.New("invalid data size")
 	}
 
-	// 同样使用 C.malloc 分配 float* 数组，避免 Go slice 的指针被直接传入 C
-	ptrSize := unsafe.Sizeof((*C.float)(nil))
-	ptrsMem := C.malloc(C.size_t(ptrSize) * C.size_t(batchSize))
-	if ptrsMem == nil {
-		return nil, errors.New("malloc for graph input ptrs failed")
-	}
-	defer C.free(ptrsMem)
-
-	cPtrArray := (*[1 << 30]*C.float)(ptrsMem)
-	for i := range batchSize {
+	// 用整数数组保存每条样本的地址，不直接做“指针数组”
+	ptrs := make([]C.uintptr_t, batchSize)
+	for i := 0; i < batchSize; i++ {
 		if data[i] == nil || len(data[i]) == 0 {
-			cPtrArray[i] = nil
+			ptrs[i] = 0
 		} else {
-			cPtrArray[i] = (*C.float)(unsafe.Pointer(&data[i][0]))
+			// 把 &data[i][0] 转成 uintptr 再转成 C.uintptr_t
+			ptrs[i] = C.uintptr_t(uintptr(unsafe.Pointer(&data[i][0])))
 		}
 	}
 
-	cPtrs := (**C.float)(ptrsMem)
+	var cPtr *C.uintptr_t
+	if batchSize > 0 {
+		cPtr = (*C.uintptr_t)(unsafe.Pointer(&ptrs[0]))
+	} else {
+		cPtr = nil
+	}
+
 	cShape := (*C.int64_t)(unsafe.Pointer(&shape[0]))
 	cShapeLen := C.size_t(len(shape))
 
@@ -467,21 +467,21 @@ func CreateGraphInputBatchFromGo(
 	cPing := C.int(pingIndex)
 	cInputIndex := C.int(inputIndex)
 
-	out := C.ORT_CreateOrUpdateGraphInput(
+	out := C.ORT_CreateOrUpdateGraphInput_FromUintptr(
 		sess,
 		cPing,
 		cInputIndex,
-		cPtrs,
+		cPtr,
 		cBatchSize,
 		cSingleLen,
 		cShape,
 		cShapeLen,
 	)
 	if out == nil {
-		return nil, errors.New("ORT_CreateOrUpdateGraphInput failed")
+		return nil, errors.New("ORT_CreateOrUpdateGraphInput_FromUintptr failed")
 	}
 
-	// 返回的 ORTTensor 属于 session/graph 管理，不需要每批释放
+	// ORTTensor 属于 session 管理，不需要额外释放
 	return out, nil
 }
 
